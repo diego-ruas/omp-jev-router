@@ -53,6 +53,7 @@ const TASK_TYPES = ["coding", "research", "operations", "documentation", "review
 const COMPLEXITIES = ["trivial", "low", "medium", "high"] as const;
 const RISKS = ["low", "medium", "high"] as const;
 const WRITE_TOOLS: Record<string, true> = { write: true, edit: true, ast_edit: true };
+const CONTINUATION_PREFIX = "Jev final evaluation:";
 const CONFIG_PATH = join(homedir(), ".omp", "agent", "jev-router.json");
 // Bundled default shipped with the npm plugin; user config at CONFIG_PATH overrides it.
 const BUNDLED_CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "jev-router.json");
