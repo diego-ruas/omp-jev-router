@@ -1,0 +1,18 @@
+{
+  "name": "omp-jev-router",
+  "version": "0.1.0",
+  "description": "Jev Decision Layer: fast-path + cached Jev triage routing models/thinking per prompt (sticky follow-ups, hysteresis, shadow safety)",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "diego-ruas"
+  },
+  "repository": "github:diego-ruas/omp-jev-router",
+  "keywords": ["omp-plugin", "pi-extension", "jev", "model-router"],
+  "omp": {
+    "extensions": ["./extensions/jev-router.ts"]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.0.0"
+  }
+}

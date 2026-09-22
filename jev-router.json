@@ -1,0 +1,44 @@
+{
+  "enabled": true,
+  "jev": {
+    "endpoint": "https://openrouter.ai/api/alpha/decisions",
+    "model": "typesafe/jev-1.13",
+    "timeoutMs": 1800,
+    "cacheSeconds": 300,
+    "maxPromptChars": 2000
+  },
+  "models": {
+    "luna": ["openai-codex/gpt-5.6-luna"],
+    "muse": ["commandcode/meta/muse-spark-1.3-contributor"],
+    "sol": ["openai-codex/gpt-5.6-sol"],
+    "deepseek": ["commandcode/deepseek/deepseek-v4.1-flash"],
+    "opus": ["anthropic/claude-opus-5-5"],
+    "sonnet": ["anthropic/claude-sonnet-5"]
+  },
+  "thinking": {
+    "luna": "low",
+    "muse": "low",
+    "sol": "high",
+    "deepseek": "low",
+    "opus": "medium",
+    "sonnet": "medium"
+  },
+  "safety": {
+    "enabled": true,
+    "mode": "shadow",
+    "tools": ["bash", "write", "edit", "ast_edit"]
+  },
+  "finalEval": {
+    "enabled": true,
+    "threshold": 0.8
+  },
+  "economy": {
+    "stickyFollowUps": true,
+    "followUpMaxChars": 120,
+    "solThinkingBelowHighRisk": "medium"
+  },
+  "logging": {
+    "enabled": true,
+    "path": "~/.omp/agent/jev-evals.jsonl"
+  }
+}
