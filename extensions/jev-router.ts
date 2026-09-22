@@ -32,7 +32,6 @@ type Config = {
   models: Record<Target, string[]>;
   thinking: Record<Target, string>;
   safety: { enabled: boolean; mode: "shadow" | "enforce"; tools: string[] };
-  finalEval: { enabled: boolean; threshold: number };
   economy: { stickyFollowUps: boolean; followUpMaxChars: number; solThinkingBelowHighRisk: string };
   logging: { enabled: boolean; path: string };
 };
@@ -47,16 +46,21 @@ type RuntimeContext = {
 };
 type JevAnswer = { type?: string; choice?: string; noul?: number };
 type JevResponse = { answers?: Record<string, JevAnswer> };
-type TurnState = { prompt: string; decision: Decision; writes: number; continued: boolean; sessionTarget: Target; pendingTarget?: Target; pendingCount: number; history: Decision[] };
+type TurnState = { prompt: string; decision: Decision; sessionTarget: Target; pendingTarget?: Target; pendingCount: number; history: Decision[] };
 
 const TASK_TYPES = ["coding", "research", "operations", "documentation", "review", "planning", "design", "other"] as const;
 const COMPLEXITIES = ["trivial", "low", "medium", "high"] as const;
 const RISKS = ["low", "medium", "high"] as const;
 const WRITE_TOOLS: Record<string, true> = { write: true, edit: true, ast_edit: true };
 const CONTINUATION_PREFIX = "Jev final evaluation:";
-const CONFIG_PATH = join(homedir(), ".omp", "agent", "jev-router.json");
+// Loader substitutes ${OMP_PLUGIN_ROOT} only in MCP/stdio configs, not in extension code,
+// so resolve the same locations here: explicit env wins, install dir via import.meta, homedir last.
+const PLUGIN_ROOT = process.env.OMP_PLUGIN_ROOT ?? process.env.CLAUDE_PLUGIN_ROOT
+  ?? join(dirname(fileURLToPath(import.meta.url)), "..");
+const PLUGIN_DATA = process.env.PLUGIN_DATA ?? join(homedir(), ".omp", "agent");
+const CONFIG_PATH = join(PLUGIN_DATA, "jev-router.json");
 // Bundled default shipped with the npm plugin; user config at CONFIG_PATH overrides it.
-const BUNDLED_CONFIG_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "jev-router.json");
+const BUNDLED_CONFIG_PATH = join(PLUGIN_ROOT, "jev-router.json");
 const DEFAULT_CONFIG: Config = {
   enabled: true,
   jev: { endpoint: "https://openrouter.ai/api/alpha/decisions", model: "typesafe/jev-1.13", timeoutMs: 1800, cacheSeconds: 300, maxPromptChars: 2000 },
@@ -70,9 +74,8 @@ const DEFAULT_CONFIG: Config = {
   },
   thinking: { luna: "low", muse: "low", sol: "high", deepseek: "low", opus: "medium", sonnet: "medium" },
   safety: { enabled: true, mode: "shadow", tools: ["bash", "write", "edit", "ast_edit"] },
-  finalEval: { enabled: true, threshold: 0.8 },
   economy: { stickyFollowUps: true, followUpMaxChars: 120, solThinkingBelowHighRisk: "medium" },
-  logging: { enabled: true, path: "~/.omp/agent/jev-evals.jsonl" },
+  logging: { enabled: true, path: join(PLUGIN_DATA, "jev-evals.jsonl") },
 };
 
 let config = DEFAULT_CONFIG;
@@ -127,7 +130,6 @@ function loadConfig(): Config {
     models: { ...DEFAULT_CONFIG.models, ...asRecord(raw.models) } as Config["models"],
     thinking: { ...DEFAULT_CONFIG.thinking, ...asRecord(raw.thinking) } as Config["thinking"],
     safety: { ...DEFAULT_CONFIG.safety, ...asRecord(raw.safety) } as Config["safety"],
-    finalEval: { ...DEFAULT_CONFIG.finalEval, ...asRecord(raw.finalEval) } as Config["finalEval"],
     economy: { ...DEFAULT_CONFIG.economy, ...asRecord(raw.economy) } as Config["economy"],
     logging: { ...DEFAULT_CONFIG.logging, ...asRecord(raw.logging) } as Config["logging"],
   };
@@ -139,15 +141,19 @@ function normalize(text: unknown): string {
   return String(text ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 }
 
+function resolveUserPath(path: string): string {
+  return path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
+
 function logEvent(cfg: Config, event: Record<string, unknown>): void {
   if (!cfg.logging.enabled) return;
-  const path = cfg.logging.path.startsWith("~/") ? join(homedir(), cfg.logging.path.slice(2)) : cfg.logging.path;
   try {
-    appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
+    appendFileSync(resolveUserPath(cfg.logging.path), `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
   } catch {
     // Logging must never affect routing.
   }
 }
+
 
 function hash(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
@@ -464,7 +470,7 @@ function safeInputText(input: unknown): string {
 function dangerousCall(toolName: string, input: unknown): string | undefined {
   const text = safeInputText(input);
   if (!text) return undefined;
-  if (toolName === "bash" && /\b(rm\s+-rf|mkfs|dd\s+if=|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|git\s+push\s+(-f|--force)|docker\s+system\s+prune|systemctl\s+(stop|disable)|curl\b|wget\b|sudo\b|ssh\b|scp\b)/.test(text)) {
+  if (toolName === "bash" && /\b(rm\s+-rf|mkfs|dd\s+if=|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|git\s+push\s+(-f|--force)|docker\s+system\s+prune|systemctl\s+(stop|disable)|curl\b|wget\b|sudo\b|ssh\b|scp\b|credential|secret|password|token)\b/.test(text)) {
     return "destructive or external shell command";
   }
   if (WRITE_TOOLS[toolName] && /\/etc\/|\.ssh\/|authorized_keys|\.env\b|private[_ -]?key/.test(text)) return "sensitive file write";
@@ -472,22 +478,6 @@ function dangerousCall(toolName: string, input: unknown): string | undefined {
   return undefined;
 }
 
-function lastAssistantText(messages: unknown): string {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = asRecord(messages[i]);
-    if (message.role !== "assistant") continue;
-    if (typeof message.content === "string" && message.content) return message.content;
-    if (!Array.isArray(message.content)) continue;
-    const text = message.content
-      .map((part) => asRecord(part))
-      .filter((part) => part.type === "text" && typeof part.text === "string")
-      .map((part) => part.text as string)
-      .join("\n");
-    if (text) return text;
-  }
-  return "";
-}
 
 export default function (pi: ExtensionAPI) {
   const z = pi.zod;
@@ -512,13 +502,29 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Serialize per session: OMP can emit this hook twice for one prompt, and concurrent
+  // subagents share this module. Without the gate both calls run decide() → double Jev
+  // billing and a last-writer-wins race on turns/sessionTarget.
+  const routing = new Map<string, Promise<void>>();
   pi.on("before_agent_start", async (event: { prompt?: string }, ctx: RuntimeContext) => {
+    const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
+    while (routing.has(sessionId)) await routing.get(sessionId)?.catch(() => undefined);
+    let release: () => void = () => undefined;
+    routing.set(sessionId, new Promise<void>((resolve) => { release = resolve; }));
+    try {
+      await routeTurn(pi, event.prompt, ctx);
+    } finally {
+      routing.delete(sessionId);
+      release();
+    }
+  });
+
+  async function routeTurn(pi: ExtensionAPI, rawPrompt: string | undefined, ctx: RuntimeContext): Promise<void> {
     const cfg = loadConfig();
-    const prompt = event.prompt?.trim();
+    const prompt = rawPrompt?.trim();
     if (!cfg.enabled || !enabled || !prompt || prompt.startsWith(CONTINUATION_PREFIX)) return;
     const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
     const previous = turns.get(sessionId);
-    // OMP can emit this hook twice for one prompt; the first call already routed it.
     if (previous?.prompt === prompt) return;
 
     const tools = pi.getAllTools() as Tool[];
@@ -566,9 +572,8 @@ export default function (pi: ExtensionAPI) {
       pendingCount = 0;
     }
     const switchedTarget = prevTarget !== undefined && effectiveTarget !== prevTarget;
-    const sessionTarget = effectiveTarget;
     turns.delete(sessionId);
-    turns.set(sessionId, { prompt, decision, writes: 0, continued: false, sessionTarget, pendingTarget, pendingCount, history });
+    turns.set(sessionId, { prompt, decision, sessionTarget: effectiveTarget, pendingTarget, pendingCount, history });
     if (turns.size > TURNS_MAX) turns.delete(turns.keys().next().value as string);
     lastDecisionBySession.set(sessionId, decision);
     if (sticky) logEvent(cfg, { kind: "routing", prompt_hash: hash(prompt), ...decision, thinking: thinkingFor(cfg, decision), latency_ms: 0 });
@@ -598,7 +603,7 @@ export default function (pi: ExtensionAPI) {
     }
     ctx.ui?.setStatus?.("jev-router", `${decision.target} (${shortId(model)}, ${thinkingFor(cfg, decision)}) · ${decision.type}/${decision.risk}${decision.source === "jev" ? "" : ` · ${decision.source}`}`);
     // No system-prompt injection: a per-turn change would bust the cached prompt prefix every turn.
-  });
+  }
 
   pi.on("tool_call", async (event: { toolName: string; input: unknown }, ctx: RuntimeContext) => {
     const cfg = loadConfig();
@@ -612,12 +617,6 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason: `Jev Router bloqueou: ${reason} via ${event.toolName}.` };
     }
     notify(ctx, `Jev Router [shadow, não bloqueou]: ${reason} via ${event.toolName}. Revise o comando antes de executar.`, "warning");
-  });
-
-  pi.on("tool_result", async (event: { toolName: string; isError?: boolean }, ctx: RuntimeContext) => {
-    if (!WRITE_TOOLS[event.toolName] || event.isError) return;
-    const turn = turns.get(ctx.sessionManager?.getSessionId?.() ?? "default");
-    if (turn) turn.writes++;
   });
 
   pi.on("session_start", async (_event: unknown, ctx: RuntimeContext) => {
