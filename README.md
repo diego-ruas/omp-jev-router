@@ -22,6 +22,8 @@ git clone https://github.com/diego-ruas/omp-jev-router ~/.omp/plugins-src/omp-je
 omp plugin link ~/.omp/plugins-src/omp-jev-router
 ```
 
+The shipped targets point at the author's providers (`openai-codex`, `anthropic`, `commandcode`). On any other setup, `/jev-router models` flags each unresolved target with ⚠, and the router keeps the current model for them. Adapt `targets` to your registry (`/jev-router available`) before relying on it; the prompt below does that for you.
+
 ### Install with your AI
 
 Paste this into omp (or any coding agent with shell access):
