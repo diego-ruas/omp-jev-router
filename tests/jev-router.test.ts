@@ -5,8 +5,8 @@ import { __jevRouterTest as T } from "../extensions/jev-router.ts";
 
 const {
   mergeRaw, validateConfig, chooseTarget, thinkingFor,
-  fastPath, heuristic, highRisk, normalize, resolveModel, pick,
-  dangerousCall, TASK_TYPES, COMPLEXITIES, RISKS,
+  fastPath, heuristic, highRisk, normalize, cacheKey, resolveModel, pick,
+  dangerousCall, callJev, authDelayMs, resetAuthState, authState, TASK_TYPES, COMPLEXITIES, RISKS,
 } = T;
 
 type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
@@ -259,5 +259,113 @@ describe("dangerousCall", () => {
   test("leitura inocente não dispara; input nunca sai da máquina (só hash)", () => {
     expect(dangerousCall("read", { path: "README.md" })).toBeUndefined();
     expect(dangerousCall("bash", { command: "ls -la" })).toBeUndefined();
+  });
+});
+
+describe("auth absoluto: cadeia de candidatas + half-open", () => {
+  const { cfg } = validCfg();
+  const okBody = JSON.stringify({ answers: { task_type: { type: "choice", choice: "coding" }, complexity: { type: "choice", choice: "low" }, risk: { type: "choice", choice: "low" } } });
+  const ok = (key: string) => new Response(okBody, { status: 200 });
+  const denied = () => new Response('{"error":{"message":"Unauthorized"}}', { status: 401 });
+  const dead = () => new Response('{"error":{"message":"User not found.","code":401}}', { status: 401 });
+  function ctxWith(registryKey: string | undefined, seen: string[]) {
+    return {
+      sessionManager: { getSessionId: () => "s1" },
+      modelRegistry: {
+        getApiKeyForProvider: async () => {
+          seen.push("registry");
+          return registryKey;
+        },
+      },
+    };
+  }
+  function withFetch(handler: (key: string) => Response, fn: () => Promise<void>) {
+    const orig = globalThis.fetch;
+    // @ts-expect-error mock parcial
+    globalThis.fetch = async (_url: unknown, init: { headers: { Authorization: string } }) => handler(init.headers.Authorization.slice(7));
+    return fn().finally(() => { globalThis.fetch = orig; });
+  }
+
+  test("registry obsoleta + env válida: usa env sem breaker", async () => {
+    T.resetAuthState();
+    process.env.OPENROUTER_API_KEY = "env-good";
+    const seen: string[] = [];
+    await withFetch((key) => key === "env-good" ? ok(key) : denied(), async () => {
+      const res = await T.callJev(ctxWith("stale-key", seen), cfg, { request: "x" }, {});
+      expect(res.answers?.risk).toBeDefined();
+    });
+    expect(T.authState().blockedUntil).toBeLessThanOrEqual(Date.now());
+    delete process.env.OPENROUTER_API_KEY;
+  });
+
+  test("401 em todas: abre breaker; probe após backoff fecha em sucesso", async () => {
+    T.resetAuthState();
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.JEV_API_KEY;
+    const seen: string[] = [];
+    await withFetch(() => denied(), async () => {
+      await expect(T.callJev(ctxWith("dead-key", seen), cfg, { request: "x" }, {})).rejects.toThrow("401");
+      // Breaker aberto: nem chega ao fetch.
+      let fetched = false;
+      const orig = globalThis.fetch;
+      // @ts-expect-error mock parcial
+      globalThis.fetch = async () => { fetched = true; return denied(); };
+      await expect(T.callJev(ctxWith("dead-key", seen), cfg, { request: "x" }, {})).rejects.toThrow("circuit breaker");
+      expect(fetched).toBe(false);
+      globalThis.fetch = orig;
+    });
+    expect(T.authDelayMs(1)).toBe(30_000);
+    expect(T.authDelayMs(4)).toBe(240_000);
+    expect(T.authDelayMs(9)).toBe(300_000);
+    T.resetAuthState();
+    const seen2: string[] = [];
+    await withFetch((key) => ok(key), async () => {
+      const res = await T.callJev(ctxWith("fresh-key", seen2), cfg, { request: "x" }, {});
+      expect(res.answers?.risk).toBeDefined();
+    });
+    expect(T.authState().failures).toBe(0);
+  });
+
+  test("User not found no registry + env válida de outra conta: usa env", async () => {
+    T.resetAuthState();
+    process.env.OPENROUTER_API_KEY = "env-other-account";
+    delete process.env.JEV_API_KEY;
+    let calls = 0;
+    await withFetch((key) => { calls++; return key === "env-other-account" ? ok(key) : dead(); }, async () => {
+      const res = await T.callJev(ctxWith("gone", []), cfg, { request: "x" }, {});
+      expect(res.answers?.risk).toBeDefined();
+    });
+    expect(calls).toBe(2);
+    expect(T.authState().blockedUntil).toBeLessThanOrEqual(Date.now());
+    delete process.env.OPENROUTER_API_KEY;
+  });
+
+  test("User not found em todas: backoff longo imediato", async () => {
+    T.resetAuthState();
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.JEV_API_KEY;
+    let calls = 0;
+    await withFetch(() => { calls++; return dead(); }, async () => {
+      await expect(T.callJev(ctxWith("gone", []), cfg, { request: "x" }, {})).rejects.toThrow("User not found");
+    });
+    // 1 chamada: refresh devolve a mesma chave e o dedup pula o refetch.
+    expect(calls).toBe(1);
+    expect(T.authState().blockedUntil - Date.now()).toBeGreaterThan(200_000);
+    T.resetAuthState();
+  });
+});
+
+describe("cacheKey: normaliza case/pontuação, preserva palavras", () => {
+  test("mesmo prompt com case e pontuação diferentes acerta", () => {
+    expect(cacheKey("Fix the CSS bug!")).toBe(cacheKey("fix the css bug"));
+  });
+  test("whitespace extra não quebra o hit", () => {
+    expect(cacheKey("fix   the\ncss bug")).toBe(cacheKey("fix the css bug"));
+  });
+  test("palavras diferentes não colidem", () => {
+    expect(cacheKey("e agora o footer?")).not.toBe(cacheKey("e agora o header?"));
+  });
+  test("acentos não quebram o hit", () => {
+    expect(cacheKey("ação de correção")).toBe(cacheKey("acao de correcao"));
   });
 });

@@ -3,7 +3,7 @@
   "jev": {
     "provider": "openrouter",
     "endpoint": "https://openrouter.ai/api/alpha/decisions",
-    "model": "typesafe/jev-1.13",
+    "model": "~typesafe/jev-latest",
     "timeoutMs": 1800,
     "cacheSeconds": 300,
     "maxPromptChars": 2000

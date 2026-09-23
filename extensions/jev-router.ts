@@ -85,13 +85,37 @@ const JEV_CACHE_MAX = 20;
 const jevCache = new Map<string, { decision: Decision; at: number }>();
 const TURNS_MAX = 50;
 const HISTORY_MAX = 10;
+// Auth state is intentionally global: the Jev credential is user-scoped, not session-scoped
+// (registry key, OPENROUTER_API_KEY, JEV_API_KEY are identical in every session). A per-session
+// breaker would retry the same dead credential once per session; a per-session key cache would
+// repeat the same refresh in each. Session-scoped state lives in `turns` (keyed by session id).
 let keyCache: { value: string; expiresAt: number } | undefined;
+// Auth breaker with half-open probe: a 401/403 on every credential candidate opens it.
+// After the backoff elapses the next real triage is the probe (no background request); success
+// closes, failure reopens with backoff capped at BREAKER_MAX_MS.
+const BREAKER_MAX_MS = 300_000;
+const PROBE_AFTER_MS = 30_000;
 let authBlockedUntil = 0;
+let authFailures = 0;
 const turns = new Map<string, TurnState>();
 let lastError: string | undefined;
 
+function authDelayMs(failures: number): number {
+  return Math.min(BREAKER_MAX_MS, PROBE_AFTER_MS * 2 ** Math.max(0, failures - 1));
+}
+
+function resetAuthState(): void {
+  keyCache = undefined;
+  authBlockedUntil = 0;
+  authFailures = 0;
+}
+
+
 function fallbackCause(message: string): string {
-  if (/circuit breaker/i.test(message)) return "auth em espera após 401/403";
+  if (/circuit breaker/i.test(message)) {
+    const waitS = Math.max(0, Math.ceil((authBlockedUntil - Date.now()) / 1000));
+    return waitS > 0 ? `auth em espera após 401/403 (nova tentativa em ~${waitS}s)` : "auth em espera após 401/403 (nova tentativa na próxima mensagem)";
+  }
   if (/credential/i.test(message)) return "sem credencial para o Jev";
   const status = /Jev HTTP (\d+)/.exec(message)?.[1];
   if (status) return `Jev HTTP ${status}`;
@@ -281,7 +305,7 @@ function loadConfig(): Config | undefined {
     config = next;
     // Cached decisions carry a target resolved under the old policy; the key may be for another provider.
     jevCache.clear();
-    keyCache = undefined;
+    resetAuthState();
   }
   return config;
 }
@@ -298,20 +322,61 @@ function normalize(text: unknown): string {
   return String(text ?? "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
 }
 
-function logEvent(cfg: Config, event: Record<string, unknown>): void {
+const LOG_FLUSH_MS = 2000;
+const LOG_BATCH_MAX = 50;
+let logBuffer: string[] = [];
+let logTimer: NodeJS.Timeout | undefined;
+let logPathCache = "";
+let logPathResolved = "";
+
+function flushLog(): void {
+  if (logTimer !== undefined) {
+    clearTimeout(logTimer);
+    logTimer = undefined;
+  }
+  if (logBuffer.length === 0 || !logPathCache) return;
+  const batch = logBuffer.join("");
+  logBuffer = [];
+  try {
+    appendFileSync(logPathCache, batch);
+  } catch {
+    // Logging must never affect routing.
+  }
+}
+
+if (typeof process !== "undefined" && typeof process.once === "function") {
+  process.once("exit", flushLog);
+}
+
+function logEvent(cfg: Config, event: Record<string, unknown>, flush = false): void {
   if (!cfg.logging.enabled) return;
   // "~/x" is home-relative; a relative path lives next to the user config (PLUGIN_DATA).
   const path = cfg.logging.path.startsWith("~/") ? join(homedir(), cfg.logging.path.slice(2)) : resolve(PLUGIN_DATA, cfg.logging.path);
-  try {
-    appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
-  } catch {
-    // Logging must never affect routing.
+  if (path !== logPathResolved) {
+    flushLog();
+    logPathCache = path;
+    logPathResolved = path;
+  }
+  logBuffer.push(`${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`);
+  if (flush || logBuffer.length >= LOG_BATCH_MAX) {
+    flushLog();
+    return;
+  }
+  if (logTimer === undefined) {
+    logTimer = setTimeout(flushLog, LOG_FLUSH_MS);
+    const timer = logTimer as unknown as { unref?: () => void };
+    timer.unref?.();
   }
 }
 
 
 function hash(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+// Cache key: follow-up rewrites ("e agora o footer?" vs "e agora o header?") must differ,
+// but case/accent/punctuation/whitespace rewrites of the same prompt should hit.
+function cacheKey(text: string): string {
+  return hash(normalize(text).replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim());
 }
 
 function notify(ctx: RuntimeContext, text: string, level: "info" | "warning" = "info"): void {
@@ -462,15 +527,25 @@ function probability(response: JevResponse, id: string): number {
   return answer?.type === "noul" && typeof answer.noul === "number" ? answer.noul : 0;
 }
 
-async function apiKey(ctx: RuntimeContext, cfg: Config, forceRefresh: boolean): Promise<string | undefined> {
+async function registryKey(ctx: RuntimeContext, cfg: Config, forceRefresh: boolean): Promise<string | undefined> {
   if (!forceRefresh && keyCache && keyCache.expiresAt > Date.now()) return keyCache.value;
   const sessionId = ctx.sessionManager?.getSessionId?.();
-  const provider = cfg.jev.provider;
-  const registryKey = await ctx.modelRegistry?.getApiKeyForProvider?.(provider, sessionId, forceRefresh ? { forceRefresh: true } : undefined).catch(() => undefined);
-  const envKey = provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined;
-  const value = (registryKey ?? envKey ?? process.env.JEV_API_KEY)?.trim();
+  const value = (await ctx.modelRegistry?.getApiKeyForProvider?.(cfg.jev.provider, sessionId, forceRefresh ? { forceRefresh: true } : undefined).catch(() => undefined))?.trim() || undefined;
   keyCache = value ? { value, expiresAt: Date.now() + 300_000 } : undefined;
   return value;
+}
+
+async function apiCandidates(ctx: RuntimeContext, cfg: Config, forceRefresh: boolean): Promise<string[]> {
+  const seen: Record<string, true> = {};
+  const out: string[] = [];
+  for (const raw of [await registryKey(ctx, cfg, forceRefresh), cfg.jev.provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined, process.env.JEV_API_KEY]) {
+    const value = raw?.trim();
+    if (value && !seen[value]) {
+      seen[value] = true;
+      out.push(value);
+    }
+  }
+  return out;
 }
 
 async function postJev(cfg: Config, key: string, state: unknown, questions: Record<string, unknown>): Promise<Response> {
@@ -488,25 +563,47 @@ async function postJev(cfg: Config, key: string, state: unknown, questions: Reco
   }
 }
 
+function openAuthBreaker(accountDead: boolean): void {
+  keyCache = undefined;
+  authFailures = accountDead ? 5 : authFailures + 1;
+  authBlockedUntil = Date.now() + authDelayMs(authFailures);
+}
+
 async function callJev(ctx: RuntimeContext, cfg: Config, state: unknown, questions: Record<string, unknown>): Promise<JevResponse> {
+  // Elapsed backoff means the next real triage is the half-open probe: let it through.
   if (Date.now() < authBlockedUntil) throw new Error("Jev auth circuit breaker active");
-  const key = await apiKey(ctx, cfg, false);
-  if (!key) throw new Error(`${cfg.jev.provider} credential unavailable`);
-  let response = await postJev(cfg, key, state, questions);
-  // OAuth-backed keys may be stale: refresh once, then open the breaker if still rejected.
-  if (response.status === 401 || response.status === 403) {
-    const refreshed = await apiKey(ctx, cfg, true);
-    if (refreshed && refreshed !== key) response = await postJev(cfg, refreshed, state, questions);
-  }
-  const text = await response.text();
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      keyCache = undefined;
-      authBlockedUntil = Date.now() + 300_000;
+  const tried: Record<string, true> = {};
+  let lastStatus = 0;
+  let lastBody = "";
+  let sawAccountDead = false;
+  for (let round = 0; round < 2; round++) {
+    const candidates = await apiCandidates(ctx, cfg, round === 1);
+    if (round === 0 && candidates.length === 0) throw new Error(`${cfg.jev.provider} credential unavailable`);
+    for (const key of candidates) {
+      if (tried[key]) continue;
+      tried[key] = true;
+      const response = await postJev(cfg, key, state, questions);
+      if (response.status !== 401 && response.status !== 403) {
+        const text = await response.text();
+        if (!response.ok) throw new Error(`Jev HTTP ${response.status}: ${text.slice(0, 160)}`);
+        authBlockedUntil = 0;
+        authFailures = 0;
+        keyCache = { value: key, expiresAt: Date.now() + 300_000 };
+        return asRecord(JSON.parse(text)) as JevResponse;
+      }
+      const body = await response.text();
+      lastStatus = response.status;
+      lastBody = body;
+      // Account gone for this candidate: skip it and try the next one. A forced refresh
+      // cannot resurrect it, but the env/JEV_API_KEY candidates may belong to another account.
+      if (/user not found/i.test(body)) sawAccountDead = true;
     }
-    throw new Error(`Jev HTTP ${response.status}: ${text.slice(0, 160)}`);
+    // Same key back from a forced refresh means the registry has nothing new: stop, don't loop.
+    if (round === 1) break;
   }
-  return asRecord(JSON.parse(text)) as JevResponse;
+  openAuthBreaker(sawAccountDead);
+  const detail = lastBody.slice(0, 160) || "all credential candidates rejected";
+  throw new Error(`Jev HTTP ${lastStatus || 401}: ${detail}`);
 }
 
 const TRIAGE_QUESTIONS = {
@@ -549,10 +646,10 @@ async function decide(prompt: string, ctx: RuntimeContext, cfg: Config, tools: T
   const clipped = prompt.slice(0, cfg.jev.maxPromptChars);
   const fast = fastPath(cfg, clipped, tools);
   if (fast) {
-    logEvent(cfg, { kind: "routing", prompt_hash: hash(clipped), ...fast, thinking: thinkingFor(cfg, fast), latency_ms: 0 });
+    logEvent(cfg, { kind: "routing", prompt_hash: hash(clipped), prompt_len: clipped.length, ...fast, thinking: thinkingFor(cfg, fast), latency_ms: 0 });
     return fast;
   }
-  const key = hash(clipped);
+  const key = cacheKey(clipped);
   const cached = jevCache.get(key);
   if (cached && Date.now() - cached.at < cfg.jev.cacheSeconds * 1000) {
     // Refresh recency; a hit must not log (hot path) — but keep the stored decision as-is.
@@ -576,12 +673,13 @@ async function decide(prompt: string, ctx: RuntimeContext, cfg: Config, tools: T
     jevCache.delete(key);
     jevCache.set(key, { decision, at: Date.now() });
     if (jevCache.size > JEV_CACHE_MAX) jevCache.delete(jevCache.keys().next().value as string);
-    logEvent(cfg, { kind: "routing", prompt_hash: key, ...decision, thinking: thinkingFor(cfg, decision), latency_ms: Date.now() - startedAt });
+    logEvent(cfg, { kind: "routing", prompt_hash: key, prompt_len: clipped.length, ...decision, thinking: thinkingFor(cfg, decision), latency_ms: Date.now() - startedAt }, true);
     return decision;
   } catch (error) {
+    const cause = error instanceof Error ? (error.cause === undefined ? "" : ` | cause: ${String(error.cause).slice(0, 80)}`) : "";
     lastError = error instanceof Error ? error.message : String(error);
-    const message = lastError.slice(0, 160);
-    logEvent(cfg, { kind: "routing", prompt_hash: key, ...baseline, thinking: thinkingFor(cfg, baseline), error: message, latency_ms: Date.now() - startedAt });
+    const message = `${lastError.slice(0, 160)}${cause}`;
+    logEvent(cfg, { kind: "routing", prompt_hash: key, prompt_len: clipped.length, ...baseline, thinking: thinkingFor(cfg, baseline), error: message, latency_ms: Date.now() - startedAt }, true);
     notify(ctx, `Jev Router: triagem indisponível (${fallbackCause(lastError)}). Usando regra local: ${baseline.target} (${baseline.type}/${baseline.risk}).`, "warning");
     return baseline;
   }
@@ -651,9 +749,14 @@ export const __jevRouterTest = {
   heuristic,
   highRisk,
   normalize,
+  cacheKey,
   resolveModel,
   pick,
   dangerousCall,
+  callJev,
+  authDelayMs,
+  resetAuthState,
+  authState: () => ({ blockedUntil: authBlockedUntil, failures: authFailures }),
   TASK_TYPES,
   COMPLEXITIES,
   RISKS,
@@ -802,8 +905,7 @@ export default function (pi: ExtensionAPI) {
         configStamp = "";
         reportedIssuesStamp = "";
         jevCache.clear();
-        keyCache = undefined;
-        authBlockedUntil = 0;
+        resetAuthState();
       }
       const cfg = loadConfig();
       const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
