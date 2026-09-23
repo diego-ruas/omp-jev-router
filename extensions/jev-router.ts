@@ -640,6 +640,24 @@ function dangerousCall(toolName: string, input: unknown): string | undefined {
   return undefined;
 }
 
+// Test seam: pure functions with no omp dependency, exercised by bun test and the
+// pre-commit/pre-release gate. Tree-shaken from the shipped plugin (default export only).
+export const __jevRouterTest = {
+  mergeRaw,
+  validateConfig,
+  chooseTarget,
+  thinkingFor,
+  fastPath,
+  heuristic,
+  highRisk,
+  normalize,
+  resolveModel,
+  pick,
+  dangerousCall,
+  TASK_TYPES,
+  COMPLEXITIES,
+  RISKS,
+};
 
 export default function (pi: ExtensionAPI) {
   const z = pi.zod;
