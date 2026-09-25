@@ -16,6 +16,19 @@ Routing extras:
 - Shadow-by-default safety net for destructive tool calls
 - `/jev-router` command: `status | on | off | reload | config | models | available [provider] | test <prompt> | history | rewind`
 
+## 0.3.0
+
+Four decision points instead of one, and every answer is revalidated by the host before it is applied.
+
+- **`safety.jev` — tool gate.** The deterministic regex runs first and owns hard denies; Jev then judges the grey zone from the *redacted* action (secrets masked, capped, never file contents or tool output) and answers allow/ask/deny plus an irreversibility `noul`. Composition is calibrated on measured samples: `allow` needs probability mass >= `minConfidence` and `irreversible < 0.5`; `deny` needs mass >= 0.9 **and** `irreversible >= 0.5`; everything else asks. Only an `allow` is cached, keyed by the exact argument hash. Shadow by default.
+- **`cascade` — subagent model selection.** A `task` assignment is graded easy/medium/hard and the child *starts* on the matching target's model instead of being switched after its first turn; the assignment is marked so the child does not re-triage it.
+- **`verify` — post-run check.** At session stop, both primitives must agree before one extra pass is requested (`maxContinuations`), and the check is advisory: never a blocking stop.
+- **Host-prepared candidates and revalidation.** Routing sends its eligible targets as candidate IDs and, with `decision.mode: "select"`, takes back one of those IDs; `validateRoute` rechecks id, policy revision, expiry, candidate fingerprint and dispatchability, and falls back to the deterministic rule on any rejection. Low-confidence answers abstain instead of routing on a coin flip, and a model chosen outside the router is kept (`respectManualModel`).
+- **Evidence.** Every record is `schema: "jev-log/1"` with a typed `fallback` code, `calls_used`, the candidate fingerprint, the probability mass and the observed outcome; `jev-benchmark.py` summarizes them.
+- **Credential handling.** A rejected key no longer costs every decision a wasted request, a rotated key lifts the breaker immediately, and a 401 names the fix.
+
+134 tests, strict typecheck, build and secret scan are part of `./scripts/check-release.sh`.
+
 ## Install
 
 Straight from GitHub (no npm publish needed):
