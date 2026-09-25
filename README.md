@@ -71,7 +71,7 @@ Edits are picked up on the next prompt (mtime check); `/jev-router reload` also 
 
 | Section | Purpose |
 |---|---|
-| `jev` | Triage classifier: `provider` (credential lookup), `endpoint`, `model`, `timeoutMs`, `cacheSeconds`, `maxPromptChars` |
+| `jev` | Triage classifier: `provider` (credential lookup), `endpoint`, `model`, `timeoutMs`, `cacheSeconds`, `maxPromptChars`, `minConfidence` (abstention threshold), `decisionTtlMs` (prepared-decision expiry) |
 | `providers.allow` | Providers targets may use; a target model outside it is a config error. `[]` = any |
 | `targets.<name>` | `models`: ordered `provider/id` fallbacks (first one in the omp registry wins, exact provider). `thinking`: `off \| minimal \| low \| medium \| high \| xhigh \| max`, or per risk `{ "high": "high", "default": "medium" }` |
 | `routes` | Ordered `{ "when": { "type"?, "complexity"?, "risk"? }, "target" }`; first match wins. Lists inside a field are OR, fields are AND. The last route must omit `when` (catch-all) |
@@ -79,7 +79,7 @@ Edits are picked up on the next prompt (mtime check); `/jev-router reload` also 
 | `safety.jev` | Tool gate: `enabled`, `tools` (only these are sent, redacted), `timeoutMs`, `cacheSeconds`, `maxActionChars`, `minConfidence`, `askInHeadless` (`warn` \| `block`) |
 | `verify` | Post-run check: `enabled`, `minConfidence`, `maxContinuations` (0–8), `maxAnswerChars`, `skipTrivial` |
 | `cascade` | Subagent grading: `enabled`, `minConfidence`, `targets` (`easy`/`medium`/`hard` → target name), `maxTaskChars` |
-| `economy` | `stickyFollowUps`, `followUpMaxChars` |
+| `economy` | `stickyFollowUps`, `followUpMaxChars`, `respectManualModel` (a model chosen outside the router is kept) |
 | `logging` | `enabled`, `path` (`~/` = home; relative = next to the user config) |
 
 Classifier values: `type` ∈ coding, research, operations, documentation, review, planning, design, other · `complexity` ∈ trivial, low, medium, high · `risk` ∈ low, medium, high.
@@ -94,7 +94,7 @@ Each is a separate section, each needs explicit `"enabled": true` (the shipped f
 2. Anything the regex left alone, if its tool is in `safety.jev.tools`, is sent to Jev as a `choice` (`allow`/`ask`/`deny`) plus a `noul` on irreversibility. Only `actionOf()` output leaves the machine: the shell command, or the target path of a write — never file contents, tool results, or the transcript. Secrets are redacted and the string is capped before sending.
 3. Verdicts compose conservatively: a verdict under `minConfidence`, or `irreversible ≥ 0.5`, becomes `ask` (never `allow`, and never a hard `deny`). A confident `deny` blocks; a confident `allow` runs.
 4. `ask` with a UI opens `ctx.ui.confirm`. Headless (subagents, `-p`) it follows `askInHeadless`: `warn` notifies and hands the model a scope reminder via `additionalContext`, `block` refuses the call.
-5. A Jev failure fails open — the deterministic layer already ran, and the auth breaker stops a dead credential from being retried on every call. Verdicts are cached by the redacted action (`cacheSeconds`), so a repeated command costs one request.
+5. A Jev failure fails open — the deterministic layer already ran, and the auth breaker stops a dead credential from being retried on every call. Only an `allow` is cached (keyed by the exact tool arguments, TTL `cacheSeconds`), so a repeated command costs one request; a refusal is never sticky, because a false `deny` served from cache would have no escape for the whole TTL.
 
 In `shadow` the gate never blocks and never prompts; it only logs and notifies, which is what you want while calibrating thresholds against `jev-evals.jsonl`. Switch `safety.mode` to `enforce` when the log shows no false `deny`/`ask` on your ordinary commands.
 
@@ -103,6 +103,21 @@ In `shadow` the gate never blocks and never prompts; it only logs and notifies, 
 **`verify` — the post-run check.** At session stop, Jev sees the request and the final answer's text blocks only (`maxAnswerChars`), and answers a `choice` (`done`/`incomplete`/`wrong_scope`) plus a `noul` ("the answer fully satisfies the request"). A continuation is requested only when the two agree, the answer is not `done`, and confidence clears `minConfidence` — at most `maxContinuations` per session, and never when another stop hook already asked for one. `skipTrivial` leaves trivial/`other` turns alone. A Jev failure never holds the turn open.
 
 Both `safety.jev` and `verify` send data that the routing triage does not: the redacted action, and the final answer text. That is why they are opt-in per install; leave them off for a fully local decision layer.
+
+### Keel-aligned boundaries
+
+[Keel](https://github.com/codejunkie99/keel) states the contract this extension follows: *the host owns the options, state checks, and permissions; the selector returns a choice or abstains.*
+
+| Keel rule | Here |
+|---|---|
+| The selector picks from host-prepared options | Routing sends the reachable, registry-resolvable targets as candidate IDs in the request state; the labels it may return are the host's own enums |
+| Re-validate the selection before applying | `validateRoute()` rechecks `invalid_id`, `stale_revision` (config stamp changed), `expired` (`jev.decisionTtlMs`), `stale_read_set` (candidate fingerprint changed) and `unauthorized` (payload no longer dispatchable). A rejection falls back — never applies |
+| Abstention is an answer | `jev.minConfidence` (routing abstains to the deterministic heuristic), `safety.jev.minConfidence` (gate degrades to `ask`), `cascade.minConfidence` (spawn keeps omp's model), `verify.minConfidence` (no extra pass) |
+| A selector result never grants permission | The gate can only *add* an objection: it blocks or annotates inside `tool_call`. OMP's approval path is untouched, and a Jev `allow` is never an authorization |
+| Pinned routes keep their route | `economy.respectManualModel`: if the live model is not the one this router left in place, it is treated as a manual choice and routing stops overriding it |
+| Prepared actions carry an exact payload | The gate cache key is `hash(tool + exact JSON arguments)`, never the normalized or redacted text: a verdict for one command cannot be reused for a different one. Only `allow` verdicts are cached at all |
+| Record evidence, not reasoning | Every record carries `schema: "jev-log/1"`, a typed `fallback` code, `calls_used`, the candidate fingerprint, and the observed outcome (`routing-outcome`, `safety-jev-outcome`) |
+| No selector where the host has no verified executor | Verification is advisory: `{ continue: true, additionalContext }` within `maxContinuations`, never a blocking `decision: "block"` |
 
 ### Adding a provider or model
 
@@ -132,4 +147,6 @@ Swapping a model version is a one-line change to `targets.<name>.models`; listin
 - `jev-router.json` — shipped default config; the base every user config is merged over
 - `jev-benchmark.py` — reads `~/.omp/agent/jev-evals.jsonl` and summarizes the decision log
 
-Log `kind` values: `routing`, `routing-hold`, `routing-checkpoint`, `routing-rewind`, `safety` (local regex), `safety-jev` (gate verdict), `cascade`, `cascade-handoff`, `verify`.
+Log `kind` values: `routing`, `routing-outcome`, `routing-pinned`, `routing-hold`, `routing-checkpoint`, `routing-rewind`, `safety` (local regex), `safety-jev` (gate verdict), `safety-jev-block` (what enforce did), `safety-jev-outcome` (how the call that ran finished), `cascade`, `cascade-handoff`, `verify`.
+
+Every record is stamped `schema: "jev-log/1"` and carries a typed `fallback` code when the decision did not come from Jev (`low_confidence`, `circuit_open`, `http_error`, `stale_read_set`, `expired`, `invalid_id`, `unauthorized`, …), the `calls_used` the decision cost, and the `candidates_fingerprint` it was validated against.

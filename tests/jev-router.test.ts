@@ -9,7 +9,8 @@ const {
   dangerousCall, callJev, authDelayMs, resetAuthState, authState, TASK_TYPES, COMPLEXITIES, RISKS,
   confidence, redactAction, actionOf, gateVerdict, cascadeTarget, verifyOutcome, thinkingSpecFor,
   assistantText, recordPendingSpawns, takePendingSpawn, markCascadeHandoff, consumeCascadeHandoff,
-  resetDecisionMaps, DIFFICULTIES,
+  resetDecisionMaps, DIFFICULTIES, prepareRoutes, candidatesFingerprint, validateRoute,
+  fallbackCode, exactInput, configStampForTest, cacheableGate, classifyModelChange,
 } = T;
 
 type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
@@ -566,5 +567,110 @@ describe("cascade: correlaciona task call com spawn", () => {
     markCascadeHandoff("refatorar o módulo de pagamentos");
     expect(consumeCascadeHandoff("corrigir o css do header")).toBe(false);
     expect(consumeCascadeHandoff("refatorar o módulo de pagamentos")).toBe(true);
+  });
+});
+
+describe("prepareRoutes: só candidato que o host consegue despachar", () => {
+  const { cfg } = validCfg();
+  const registry = [
+    { provider: "openai-codex", id: "gpt-6-luna" },
+    { provider: "commandcode", id: "meta/muse-spark-1.3-contributor" },
+    { provider: "anthropic", id: "claude-opus-5-5" },
+  ];
+  const ctx = { models: { list: () => registry } };
+
+  test("inclui apenas targets alcançáveis por rota e registrados", () => {
+    expect(prepareRoutes(ctx, cfg).map((c) => c.id)).toEqual(["luna", "muse", "opus"]);
+  });
+  test("target sem modelo no registro não vira candidato", () => {
+    const ids = prepareRoutes(ctx, cfg).map((c) => c.id);
+    expect(ids).not.toContain("sol");
+    expect(ids).not.toContain("sonnet");
+    expect(ids).not.toContain("deepseek");
+  });
+  test("target fora de qualquer rota não vira candidato", () => {
+    const raw = structuredClone(SHIPPED) as unknown as Record<string, unknown>;
+    (raw.targets as Record<string, unknown>).orfao = { models: ["openai-codex/gpt-6-luna"], thinking: "low" };
+    const issues: string[] = [];
+    const custom = validateConfig(raw, issues);
+    expect(custom).toBeDefined();
+    expect(prepareRoutes(ctx, custom ?? cfg).map((c) => c.id)).not.toContain("orfao");
+  });
+  test("fingerprint muda quando o conjunto observado muda", () => {
+    const before = candidatesFingerprint(prepareRoutes(ctx, cfg));
+    const wider = { models: { list: () => [...registry, { provider: "openai-codex", id: "gpt-6-sol" }] } };
+    expect(candidatesFingerprint(prepareRoutes(wider, cfg))).not.toBe(before);
+  });
+});
+
+describe("validateRoute: a seleção é reconferida antes de aplicar", () => {
+  const { cfg } = validCfg();
+  const candidates = [{ id: "muse", spec: "commandcode/meta/muse-spark-1.3-contributor" }, { id: "opus", spec: "anthropic/claude-opus-5-5" }];
+  const ok = { stamp: "", fingerprint: candidatesFingerprint(candidates), expiresAt: Date.now() + 5_000 };
+  const stamped = () => ({ ...ok, stamp: configStampForTest() });
+
+  test("aceita um ID preparado e vigente", () => {
+    expect(validateRoute(candidates, stamped(), "muse", cfg).accepted).toBe(true);
+  });
+  test("ID que o host não preparou é invalid_id", () => {
+    expect(validateRoute(candidates, stamped(), "sonnet", cfg).rejection).toBe("invalid_id");
+  });
+  test("revisão da policy mudou: stale_revision", () => {
+    expect(validateRoute(candidates, { ...ok, stamp: "outra-revisao" }, "muse", cfg).rejection).toBe("stale_revision");
+  });
+  test("read-set mudou: stale_read_set", () => {
+    expect(validateRoute(candidates, { ...stamped(), fingerprint: "outro" }, "muse", cfg).rejection).toBe("stale_read_set");
+  });
+  test("decisão preparada expirou: expired", () => {
+    expect(validateRoute(candidates, { ...stamped(), expiresAt: Date.now() - 1 }, "muse", cfg).rejection).toBe("expired");
+  });
+  test("target sem payload despachável: unauthorized", () => {
+    const semModelo = { ...cfg, targets: { ...cfg.targets, muse: { models: [], thinking: "low" } } };
+    expect(validateRoute(candidates, stamped(), "muse", semModelo).rejection).toBe("unauthorized");
+  });
+});
+
+describe("fallbackCode: motivo tipado em vez de texto livre", () => {
+  test("mapeia as causas conhecidas", () => {
+    expect(fallbackCode("Jev auth circuit breaker active")).toBe("circuit_open");
+    expect(fallbackCode("openrouter credential unavailable")).toBe("credential_unavailable");
+    expect(fallbackCode('Jev HTTP 401: {"error":{}}')).toBe("http_error");
+    expect(fallbackCode("This operation was aborted")).toBe("transport_error");
+  });
+});
+
+describe("exactInput: identidade do payload, não texto normalizado", () => {
+  test("mesmo caminho com conteúdo diferente NÃO é a mesma identidade", () => {
+    expect(exactInput({ path: "src/app.ts", content: "a" })).not.toBe(exactInput({ path: "src/app.ts", content: "b" }));
+  });
+  test("case faz parte da identidade", () => {
+    expect(exactInput({ command: "LS" })).not.toBe(exactInput({ command: "ls" }));
+  });
+  test("payload idêntico é estável", () => {
+    expect(exactInput({ command: "npm run build" })).toBe(exactInput({ command: "npm run build" }));
+  });
+});
+
+describe("cacheableGate: allow pode ser cacheado, recusa nunca", () => {
+  test("só allow vira entrada de cache", () => {
+    expect(cacheableGate({ verdict: "allow", irreversible: 0.05 })).toBe(true);
+    expect(cacheableGate({ verdict: "ask", irreversible: 0.6 })).toBe(false);
+    expect(cacheableGate({ verdict: "deny", irreversible: 0.2 })).toBe(false);
+  });
+});
+
+describe("classifyModelChange: revert do host não é escolha do usuário", () => {
+  const state = { appliedModel: "commandcode/x/muse", previousModel: "commandcode/deepseek/flash" };
+  test("mesmo modelo que o router deixou: same", () => {
+    expect(classifyModelChange(state, "commandcode/x/muse")).toBe("same");
+  });
+  test("voltou ao modelo de antes do switch: revert", () => {
+    expect(classifyModelChange(state, "commandcode/deepseek/flash")).toBe("revert");
+  });
+  test("terceiro modelo, escolhido fora do router: manual", () => {
+    expect(classifyModelChange(state, "anthropic/claude-opus-5-5")).toBe("manual");
+  });
+  test("sem switch anterior não há o que comparar", () => {
+    expect(classifyModelChange({}, "anthropic/claude-opus-5-5")).toBe("same");
   });
 });

@@ -67,6 +67,30 @@ verifications = [
     if r.get("kind") == "verify"
 ]
 
+pinned = [
+    r
+    for r in records
+    if r.get("kind") == "routing-pinned"
+]
+
+outcomes = [
+    r
+    for r in records
+    if r.get("kind") == "routing-outcome"
+]
+
+dispatched = [
+    r
+    for r in records
+    if r.get("kind") == "safety-jev-outcome"
+]
+
+blocked = [
+    r
+    for r in records
+    if r.get("kind") == "safety-jev-block"
+]
+
 
 def counts(key):
     return Counter(
@@ -115,12 +139,42 @@ fallbacks = sum(
     if r.get("source") == "fallback"
 )
 
+abstained = [
+    r
+    for r in routing
+    if r.get("fallback")
+]
+
 if routing:
     print()
     print(
         "Fallback rate    : "
         f"{fallbacks / len(routing) * 100:.1f}%"
     )
+
+if abstained:
+    print()
+    print(f"Abstentions      : {len(abstained)}/{len(routing)}")
+    for key, value in Counter(r.get("fallback") for r in abstained).most_common():
+        print(f"  {key:16} {value}")
+
+rejected = [
+    r
+    for r in outcomes
+    if r.get("outcome") == "unresolved"
+]
+
+if outcomes:
+    print()
+    print("Observed outcomes:")
+    for key, value in Counter(r.get("outcome", "unknown") for r in outcomes).most_common():
+        print(f"  {key:16} {value}")
+    if rejected:
+        print(f"  (unresolved: decision had no dispatchable model)")
+
+if pinned:
+    print()
+    print(f"Manual pins kept : {len(pinned)}")
 
 tool_conf = [
     float(r.get("tool_confidence", 0))
@@ -184,6 +238,17 @@ if cascade:
         print(f"  {key:14} {value}")
     for key, value in Counter(str(r.get("target")) for r in cascade).most_common():
         print(f"  -> {key:11} {value}")
+
+if blocked:
+    print()
+    print("Gate enforcement :")
+    for key, value in Counter(str(r.get("outcome") or r.get("verdict")) for r in blocked).most_common():
+        print(f"  {key:16} {value}")
+
+if dispatched:
+    errors = sum(1 for r in dispatched if r.get("is_error"))
+    print()
+    print(f"Gated calls that ran: {len(dispatched)} ({errors} errored)")
 
 if verifications:
     print()
