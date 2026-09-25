@@ -7,6 +7,9 @@ const {
   mergeRaw, validateConfig, chooseTarget, thinkingFor,
   fastPath, heuristic, highRisk, normalize, cacheKey, resolveModel, pick,
   dangerousCall, callJev, authDelayMs, resetAuthState, authState, TASK_TYPES, COMPLEXITIES, RISKS,
+  confidence, redactAction, actionOf, gateVerdict, cascadeTarget, verifyOutcome, thinkingSpecFor,
+  assistantText, recordPendingSpawns, takePendingSpawn, markCascadeHandoff, consumeCascadeHandoff,
+  resetDecisionMaps, DIFFICULTIES,
 } = T;
 
 type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
@@ -367,5 +370,201 @@ describe("cacheKey: normaliza case/pontuação, preserva palavras", () => {
   });
   test("acentos não quebram o hit", () => {
     expect(cacheKey("ação de correção")).toBe(cacheKey("acao de correcao"));
+  });
+});
+
+describe("seções novas da config shipped", () => {
+  const { cfg } = validCfg();
+  test("os três pontos de decisão existem e vêm desligados", () => {
+    expect(cfg.safety.jev.enabled).toBe(false);
+    expect(cfg.verify.enabled).toBe(false);
+    expect(cfg.cascade.enabled).toBe(false);
+  });
+  test("cascade aponta para targets existentes", () => {
+    for (const difficulty of DIFFICULTIES) {
+      expect(cfg.targets[cfg.cascade.targets[difficulty]]).toBeDefined();
+    }
+  });
+  test("askInHeadless inválido rejeita o arquivo", () => {
+    const raw = structuredClone(SHIPPED) as Record<string, unknown>;
+    (raw.safety as { jev: { askInHeadless: string } }).jev.askInHeadless = "bloquear";
+    const issues: string[] = [];
+    expect(validateConfig(raw, issues)).toBeUndefined();
+    expect(issues.join("\n")).toMatch(/askInHeadless/);
+  });
+  test("minConfidence fora de 0..1 rejeita o arquivo", () => {
+    const raw = structuredClone(SHIPPED) as Record<string, unknown>;
+    (raw.safety as { jev: { minConfidence: number } }).jev.minConfidence = 7;
+    const issues: string[] = [];
+    expect(validateConfig(raw, issues)).toBeUndefined();
+    expect(issues.join("\n")).toMatch(/safety\.jev\.minConfidence/);
+  });
+  test("cascade para target inexistente rejeita o arquivo", () => {
+    const raw = structuredClone(SHIPPED) as Record<string, unknown>;
+    (raw.cascade as { targets: { easy: string } }).targets.easy = "fantasma";
+    const issues: string[] = [];
+    expect(validateConfig(raw, issues)).toBeUndefined();
+    expect(issues.join("\n")).toMatch(/cascade\.targets\.easy/);
+  });
+});
+
+describe("redactAction: o que sai da máquina", () => {
+  test("header Authorization some", () => {
+    const out = redactAction("bash: curl -H 'Authorization: Bearer sk-live-abc123' https://api.example.com", 600);
+    expect(out).not.toContain("sk-live-abc123");
+    expect(out).toContain("[REDACTED]");
+    expect(out).toContain("api.example.com");
+  });
+  test("flag --token e env var de segredo", () => {
+    expect(redactAction("bash: gh auth --token ghp_example_value", 600)).not.toContain("ghp_example_value");
+    expect(redactAction("bash: OPENROUTER_API_KEY=abc123 run", 600)).toContain("OPENROUTER_API_KEY=[REDACTED]");
+    expect(redactAction("bash: MY_SECRET_TOKEN=abc123 run", 600)).toContain("MY_SECRET_TOKEN=[REDACTED]");
+  });
+  test("credencial em URL de conexão", () => {
+    const out = redactAction("bash: psql postgres://user:s3cr3t@db.internal:5432/app -c 'select 1'", 600);
+    expect(out).not.toContain("s3cr3t");
+    expect(out).toContain("postgres://user:[REDACTED]@db.internal:5432/app");
+  });
+  test("blob opaco longo vira REDACTED, comando curto passa intacto", () => {
+    expect(redactAction(`bash: echo ${"a1b2c3d4".repeat(6)}`, 600)).toContain("[REDACTED]");
+    expect(redactAction("bash: alembic upgrade head", 600)).toBe("bash: alembic upgrade head");
+  });
+  test("respeita o cap de caracteres", () => {
+    const long = `bash: docker run ${Array.from({ length: 12 }, (_, i) => `--flag${i} valor${i}`).join(" ")}`;
+    expect(long.length).toBeGreaterThan(150);
+    expect(redactAction(long, 40).length).toBe(40);
+  });
+});
+
+describe("actionOf: só o necessário, nunca conteúdo de arquivo", () => {
+  test("bash manda o comando", () => {
+    expect(actionOf("bash", { command: "npm run build" })).toBe("bash: npm run build");
+  });
+  test("write manda o caminho, não o conteúdo", () => {
+    const action = actionOf("write", { path: "src/app.ts", content: "const secret = 'nunca sai'" });
+    expect(action).toBe("write: src/app.ts");
+    expect(action).not.toContain("nunca sai");
+  });
+  test("sem comando nem caminho não há o que perguntar", () => {
+    expect(actionOf("bash", {})).toBeUndefined();
+    expect(actionOf("write", { content: "x" })).toBeUndefined();
+  });
+});
+
+describe("gateVerdict: probabilidade + confiança", () => {
+  const answer = (choice: string, conf?: number) => ({ answers: { verdict: { type: "choice", choice, ...(conf === undefined ? {} : { confidence: conf }) } } });
+  test("allow confiante passa", () => {
+    expect(gateVerdict(answer("allow", 0.95), 0.75).verdict).toBe("allow");
+  });
+  test("allow inseguro vira ask", () => {
+    expect(gateVerdict(answer("allow", 0.6), 0.75).verdict).toBe("ask");
+  });
+  test("deny confiante bloqueia", () => {
+    expect(gateVerdict(answer("deny", 0.9), 0.75).verdict).toBe("deny");
+  });
+  test("deny inseguro vira ask (quem decide é humano, não o limiar)", () => {
+    expect(gateVerdict(answer("deny", 0.4), 0.75).verdict).toBe("ask");
+  });
+  test("irreversível força ask mesmo com allow confiante", () => {
+    const response = { answers: { verdict: { type: "choice", choice: "allow", confidence: 0.99 }, irreversible: { type: "noul", noul: 0.94 } } };
+    const decision = gateVerdict(response, 0.75);
+    expect(decision.verdict).toBe("ask");
+    expect(decision.irreversible).toBeCloseTo(0.94, 5);
+  });
+  test("sem resposta válida o fallback é ask, nunca allow", () => {
+    expect(gateVerdict({}, 0.75).verdict).toBe("ask");
+    expect(gateVerdict({ answers: { verdict: { type: "choice", choice: "sei la" } } }, 0.75).verdict).toBe("ask");
+  });
+  test("confidence ausente não é lido como baixa confiança", () => {
+    expect(confidence(answer("allow"), "verdict")).toBeUndefined();
+    expect(gateVerdict(answer("allow"), 0.75).verdict).toBe("allow");
+  });
+});
+
+describe("cascadeTarget: dificuldade -> target", () => {
+  const { cfg } = validCfg();
+  const response = (choice: string, conf?: number) => ({ answers: { difficulty: { type: "choice", choice, ...(conf === undefined ? {} : { confidence: conf }) } } });
+  test("mapeia easy/medium/hard pelos targets da config", () => {
+    expect(cascadeTarget(response("easy", 0.9), cfg, 0.7)).toBe(cfg.cascade.targets.easy);
+    expect(cascadeTarget(response("hard", 0.9), cfg, 0.7)).toBe(cfg.cascade.targets.hard);
+  });
+  test("abaixo do limiar mantém o que o omp resolveu", () => {
+    expect(cascadeTarget(response("hard", 0.3), cfg, 0.7)).toBeUndefined();
+  });
+  test("thinkingSpecFor usa o nível do target", () => {
+    expect(thinkingSpecFor(cfg, cfg.cascade.targets.easy)).toBe("low");
+    expect(thinkingSpecFor(cfg, cfg.cascade.targets.hard)).toBe("medium");
+    // sol's thinking is a per-risk object: the cascade takes the default, never a risk it does not have.
+    expect(thinkingSpecFor(cfg, "sol")).toBe("medium");
+  });
+});
+
+describe("verifyOutcome: os dois primitivos precisam concordar", () => {
+  const response = (choice: string, complete: number, conf = 0.9) => ({
+    answers: { verdict: { type: "choice", choice, confidence: conf }, complete: { type: "noul", noul: complete } },
+  });
+  test("incomplete + não completo + confiante pede uma passada", () => {
+    expect(verifyOutcome(response("incomplete", 0.1), 0.8).action).toBe("continue");
+  });
+  test("incomplete mas o Noul diz completo: sem passada extra", () => {
+    expect(verifyOutcome(response("incomplete", 0.8), 0.8).action).toBe("none");
+  });
+  test("confiança baixa não força turno", () => {
+    expect(verifyOutcome(response("wrong_scope", 0.05, 0.5), 0.8).action).toBe("none");
+  });
+  test("done não gera passada", () => {
+    expect(verifyOutcome(response("done", 0.02), 0.8).action).toBe("none");
+  });
+});
+
+describe("assistantText: só texto final, nada de thinking ou tool call", () => {
+  test("junta blocos de texto e ignora o resto", () => {
+    const message = { content: [{ type: "text", text: "feito" }, { type: "thinking", text: "segredo" }, { type: "toolCall", name: "bash" }] };
+    expect(assistantText(message)).toBe("feito");
+  });
+  test("string direta", () => {
+    expect(assistantText({ content: "  pronto  " })).toBe("pronto");
+  });
+  test("shape desconhecido devolve vazio", () => {
+    expect(assistantText(undefined)).toBe("");
+    expect(assistantText({})).toBe("");
+  });
+});
+
+describe("cascade: correlaciona task call com spawn", () => {
+  test("batch casa pelo nome do item", () => {
+    resetDecisionMaps();
+    recordPendingSpawns("s1", { tasks: [{ name: "Alpha", task: "listar arquivos" }, { name: "Beta", task: "contar linhas" }] });
+    expect(takePendingSpawn("s1", "Beta")).toBe("contar linhas");
+    expect(takePendingSpawn("s1", "Alpha")).toBe("listar arquivos");
+    expect(takePendingSpawn("s1", "Alpha")).toBeUndefined();
+  });
+  test("sem nome, consome na ordem de spawn", () => {
+    resetDecisionMaps();
+    recordPendingSpawns("s1", { tasks: [{ task: "primeiro" }, { task: "segundo" }] });
+    expect(takePendingSpawn("s1", "Task")).toBe("primeiro");
+    expect(takePendingSpawn("s1", "Task-2")).toBe("segundo");
+  });
+  test("shape flat (task.batch off) também é registrado", () => {
+    resetDecisionMaps();
+    recordPendingSpawns("s1", { name: "Solo", task: "unica tarefa" });
+    expect(takePendingSpawn("s1", "Solo")).toBe("unica tarefa");
+  });
+  test("sessão sem pendência não inventa atribuição", () => {
+    resetDecisionMaps();
+    expect(takePendingSpawn("s2", "Alpha")).toBeUndefined();
+  });
+  test("handoff é consumido uma vez e reconhecido dentro do prompt do filho", () => {
+    resetDecisionMaps();
+    markCascadeHandoff("# Target\n/home/diego/x.ts\n\n# Change\ncontar linhas");
+    const childPrompt = "Complete assignment thoroughly:\n\n# Target\n/home/diego/x.ts\n\n# Change\ncontar linhas";
+    expect(consumeCascadeHandoff(childPrompt)).toBe(true);
+    expect(consumeCascadeHandoff(childPrompt)).toBe(false);
+  });
+  test("prompt de outra sessão não consome o handoff", () => {
+    resetDecisionMaps();
+    markCascadeHandoff("refatorar o módulo de pagamentos");
+    expect(consumeCascadeHandoff("corrigir o css do header")).toBe(false);
+    expect(consumeCascadeHandoff("refatorar o módulo de pagamentos")).toBe(true);
   });
 });

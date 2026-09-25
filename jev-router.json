@@ -34,7 +34,29 @@
   "safety": {
     "enabled": true,
     "mode": "shadow",
-    "tools": ["bash", "write", "edit", "ast_edit"]
+    "tools": ["bash", "write", "edit", "ast_edit"],
+    "jev": {
+      "enabled": false,
+      "tools": ["bash"],
+      "timeoutMs": 600,
+      "cacheSeconds": 300,
+      "maxActionChars": 600,
+      "minConfidence": 0.75,
+      "askInHeadless": "warn"
+    }
+  },
+  "verify": {
+    "enabled": false,
+    "minConfidence": 0.8,
+    "maxContinuations": 1,
+    "maxAnswerChars": 2000,
+    "skipTrivial": true
+  },
+  "cascade": {
+    "enabled": false,
+    "minConfidence": 0.7,
+    "targets": { "easy": "deepseek", "medium": "muse", "hard": "opus" },
+    "maxTaskChars": 1200
   },
   "economy": {
     "stickyFollowUps": true,

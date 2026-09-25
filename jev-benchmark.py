@@ -49,6 +49,24 @@ safety = [
     if r.get("kind") == "safety"
 ]
 
+gate = [
+    r
+    for r in records
+    if r.get("kind") == "safety-jev"
+]
+
+cascade = [
+    r
+    for r in records
+    if r.get("kind") == "cascade"
+]
+
+verifications = [
+    r
+    for r in records
+    if r.get("kind") == "verify"
+]
+
 
 def counts(key):
     return Counter(
@@ -143,5 +161,34 @@ if safety:
         f"{flagged}/{len(safety)} "
         f"({flagged / len(safety) * 100:.1f}%)"
     )
+
+if gate:
+    verdicts = Counter(r.get("verdict", "unknown") for r in gate)
+    print()
+    print(f"Jev gate calls   : {len(gate)}")
+    print("Gate verdicts    :")
+    for key, value in verdicts.most_common():
+        print(f"  {key:14} {value}")
+    latencies = [
+        float(r.get("latency_ms", 0))
+        for r in gate
+        if r.get("verdict") != "error"
+    ]
+    if latencies:
+        print(f"Gate avg latency : {sum(latencies) / len(latencies):.0f} ms")
+
+if cascade:
+    print()
+    print(f"Cascade spawns   : {len(cascade)}")
+    for key, value in Counter(r.get("difficulty", "unknown") for r in cascade).most_common():
+        print(f"  {key:14} {value}")
+    for key, value in Counter(str(r.get("target")) for r in cascade).most_common():
+        print(f"  -> {key:11} {value}")
+
+if verifications:
+    print()
+    print(f"Verifications    : {len(verifications)}")
+    for key, value in Counter(r.get("verdict", "unknown") for r in verifications).most_common():
+        print(f"  {key:14} {value}")
 
 print()

@@ -10,6 +10,11 @@ import { fileURLToPath } from "node:url";
 // Providers, models, thinking and policy all live in config: adding a provider/model is a JSON edit.
 // Token economy: every model switch or system-prompt change invalidates the provider prompt cache and
 // re-bills the whole context, so the router avoids both unless the task actually needs a different model.
+//
+// Three more decision points reuse the same Jev plumbing (config, auth breaker, cache, logging), all off by default:
+// - tool_call gate: deterministic regex first, then Jev allow/ask/deny on the redacted action only.
+// - before_subagent_spawn cascade: Jev grades the assignment, the spawn gets the model before the child starts.
+// - session_stop verification: Jev checks the finished answer against the request and can ask for one more pass.
 
 type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
 type Complexity = "trivial" | "low" | "medium" | "high";
@@ -33,6 +38,35 @@ type ThinkingSpec = string | Partial<Record<Risk | "default", string>>;
 type TargetConfig = { models: string[]; thinking: ThinkingSpec };
 type RouteWhen = { type?: TaskType[]; complexity?: Complexity[]; risk?: Risk[] };
 type Route = { when?: RouteWhen; target: Target };
+type Difficulty = "easy" | "medium" | "hard";
+type GateVerdict = "allow" | "ask" | "deny";
+
+// Jev gate on tool calls: the local regex decides first, this only judges the gray zone.
+// Sending the action (redacted, capped) to Jev is a deliberate data-class exception: disable to keep it local.
+type SafetyJevConfig = {
+  enabled: boolean;
+  tools: string[];
+  timeoutMs: number;
+  cacheSeconds: number;
+  maxActionChars: number;
+  minConfidence: number;
+  askInHeadless: "warn" | "block";
+};
+// Post-run verification: sends the request + the final answer to Jev (transcript exception, off by default).
+type VerifyConfig = {
+  enabled: boolean;
+  minConfidence: number;
+  maxContinuations: number;
+  maxAnswerChars: number;
+  skipTrivial: boolean;
+};
+// Subagent cascade: Jev grades an assignment and the spawn starts on the target's model.
+type CascadeConfig = {
+  enabled: boolean;
+  minConfidence: number;
+  targets: Partial<Record<Difficulty, Target>>;
+  maxTaskChars: number;
+};
 
 type Config = {
   enabled: boolean;
@@ -42,20 +76,27 @@ type Config = {
   targets: Record<Target, TargetConfig>;
   // Ordered policy: first matching route wins; the last route must be a catch-all (no "when").
   routes: Route[];
-  safety: { enabled: boolean; mode: "shadow" | "enforce"; tools: string[] };
+  safety: { enabled: boolean; mode: "shadow" | "enforce"; tools: string[]; jev: SafetyJevConfig };
   economy: { stickyFollowUps: boolean; followUpMaxChars: number };
   logging: { enabled: boolean; path: string };
+  verify: VerifyConfig;
+  cascade: CascadeConfig;
 };
 
 type Model = { provider: string; id: string };
 type Tool = { name?: string; description?: string };
 type RuntimeContext = {
-  ui?: { notify?: (text: string, level: "info" | "warning") => void; setStatus?: (key: string, value: string) => void };
+  hasUI?: boolean;
+  ui?: {
+    notify?: (text: string, level: "info" | "warning") => void;
+    setStatus?: (key: string, value: string) => void;
+    confirm?: (title: string, message: string) => Promise<boolean>;
+  };
   models?: { list?: () => Model[]; current?: () => Model | undefined };
   sessionManager?: { getSessionId?: () => string | undefined };
   modelRegistry?: { getApiKeyForProvider?: (provider: string, sessionId?: string, options?: { forceRefresh: boolean }) => Promise<string | undefined> };
 };
-type JevAnswer = { type?: string; choice?: string; noul?: number };
+type JevAnswer = { type?: string; choice?: string; noul?: number; score?: number; confidence?: number; probabilities?: Record<string, number> };
 type JevResponse = { answers?: Record<string, JevAnswer> };
 // decision is the running (effective) decision; pendingTarget is a held hysteresis suggestion.
 type TurnState = { prompt: string; decision: Decision; pendingTarget?: Target; pendingCount: number; history: Decision[] };
@@ -64,6 +105,9 @@ const TASK_TYPES = ["coding", "research", "operations", "documentation", "review
 const COMPLEXITIES = ["trivial", "low", "medium", "high"] as const;
 const RISKS = ["low", "medium", "high"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const GATE_VERDICTS = ["allow", "ask", "deny"] as const;
+const DIFFICULTIES = ["easy", "medium", "hard"] as const;
+const ASK_IN_HEADLESS = ["warn", "block"] as const;
 const WRITE_TOOLS: Record<string, true> = { write: true, edit: true, ast_edit: true };
 const CONTINUATION_PREFIX = "Jev final evaluation:";
 // Loader substitutes ${OMP_PLUGIN_ROOT} only in MCP/stdio configs, not in extension code,
@@ -83,6 +127,23 @@ let reportedIssuesStamp = "";
 let enabled = true;
 const JEV_CACHE_MAX = 20;
 const jevCache = new Map<string, { decision: Decision; at: number }>();
+// Gate verdicts keyed by the redacted action only (the request is context, not identity): the same
+// command twice must not cost two requests, and the cache TTL is what bounds staleness.
+type GateDecision = { verdict: GateVerdict; confidence?: number; irreversible: number };
+const gateCache = new Map<string, { decision: GateDecision; at: number }>();
+// Assignment text of pending spawns, keyed by session. The spawn event carries no task text, so the
+// cascade reads it from the parent's `task` tool call and matches it back by spawnKey (the item name)
+// or, when the parent let omp generate the name, by spawn order.
+type PendingSpawn = { key?: string; text: string; at: number };
+const pendingSpawns = new Map<string, PendingSpawn[]>();
+// A spawned child re-enters routing on its own first prompt. When the cascade already chose the model
+// for that assignment, the child keeps it (no second Jev call, no mid-run switch) — matched by hash.
+const cascadeHandoffs = new Map<string, { at: number }>();
+const HANDOFF_TTL_MS = 120_000;
+const PENDING_SPAWN_TTL_MS = 120_000;
+const PENDING_SPAWN_MAX = 32;
+// session_stop continuations already requested per session: the host caps at 8, one is the point.
+const verifyUsed = new Map<string, number>();
 const TURNS_MAX = 50;
 const HISTORY_MAX = 10;
 // Auth state is intentionally global: the Jev credential is user-scoped, not session-scoped
@@ -183,6 +244,12 @@ function validateConfig(raw: Record<string, unknown>, issues: string[]): Config 
     issues.push(`${name}: seção ausente ou não é objeto`);
     return {};
   };
+  const subSection = (parent: Record<string, unknown>, parentName: string, name: string): Record<string, unknown> => {
+    const value = parent[name];
+    if (isPlainObject(value)) return value;
+    issues.push(`${parentName}.${name}: seção ausente ou não é objeto`);
+    return {};
+  };
   // Old layout (top-level models/thinking): silently ignoring these would route with defaults the user thinks they overrode.
   for (const key of ["models", "thinking", "finalEval"]) {
     if (key in raw) issues.push(`${key}: formato antigo; mova para targets.<nome>.models/thinking (veja README)`);
@@ -272,6 +339,46 @@ function validateConfig(raw: Record<string, unknown>, issues: string[]): Config 
   const safety = section("safety");
   if (safety.mode !== "shadow" && safety.mode !== "enforce") issues.push(`safety.mode: "${String(safety.mode)}" inválido (use shadow | enforce)`);
   if (!isStringArray(safety.tools)) issues.push("safety.tools: lista de nomes de ferramenta");
+
+  // New decision points. Each one is a section with defaults in the shipped file; a wrong value here
+  // would silently mis-gate, so a malformed section rejects the file like any other.
+  const unit = (value: unknown, where: string, min: number, max: number, fallback: number): number => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
+      issues.push(`${where}: deve ser número entre ${min} e ${max}`);
+      return fallback;
+    }
+    return value;
+  };
+  const targetName = (value: unknown, where: string): Target => {
+    if (typeof value !== "string" || !isPlainObject(targets[value])) {
+      issues.push(`${where}: "${String(value)}" não existe em targets`);
+      return "";
+    }
+    return value;
+  };
+
+  const gate = subSection(safety, "safety", "jev");
+  if (!isStringArray(gate.tools)) issues.push("safety.jev.tools: lista de nomes de ferramenta");
+  if (!(ASK_IN_HEADLESS as readonly string[]).includes(String(gate.askInHeadless))) {
+    issues.push(`safety.jev.askInHeadless: "${String(gate.askInHeadless)}" inválido (use ${ASK_IN_HEADLESS.join(" | ")})`);
+  }
+  const gateTimeoutMs = unit(gate.timeoutMs, "safety.jev.timeoutMs", 1, 60_000, 600);
+  const gateCacheSeconds = unit(gate.cacheSeconds, "safety.jev.cacheSeconds", 0, 86_400, 0);
+  const gateMaxActionChars = unit(gate.maxActionChars, "safety.jev.maxActionChars", 40, 4_000, 600);
+  const gateMinConfidence = unit(gate.minConfidence, "safety.jev.minConfidence", 0, 1, 0);
+
+  const verify = section("verify");
+  const verifyMinConfidence = unit(verify.minConfidence, "verify.minConfidence", 0, 1, 0);
+  const verifyMaxContinuations = unit(verify.maxContinuations, "verify.maxContinuations", 0, 8, 0);
+  const verifyMaxAnswerChars = unit(verify.maxAnswerChars, "verify.maxAnswerChars", 100, 20_000, 2_000);
+
+  const cascade = section("cascade");
+  const cascadeMaxTaskChars = unit(cascade.maxTaskChars, "cascade.maxTaskChars", 40, 8_000, 1_200);
+  const cascadeMinConfidence = unit(cascade.minConfidence, "cascade.minConfidence", 0, 1, 0);
+  const cascadeTargets = subSection(cascade, "cascade", "targets");
+  const cascadeResolved = {} as Record<Difficulty, Target>;
+  for (const difficulty of DIFFICULTIES) cascadeResolved[difficulty] = targetName(cascadeTargets[difficulty], `cascade.targets.${difficulty}`);
+
   const economy = section("economy");
   if (typeof economy.followUpMaxChars !== "number") issues.push("economy.followUpMaxChars: deve ser número");
   const logging = section("logging");
@@ -284,9 +391,35 @@ function validateConfig(raw: Record<string, unknown>, issues: string[]): Config 
     providers: { allow },
     targets: targets as Config["targets"],
     routes: routes as Route[],
-    safety: { ...safety, enabled: safety.enabled !== false } as Config["safety"],
+    safety: {
+      enabled: safety.enabled !== false,
+      mode: safety.mode as "shadow" | "enforce",
+      tools: safety.tools as string[],
+      jev: {
+        enabled: gate.enabled === true,
+        tools: gate.tools as string[],
+        timeoutMs: gateTimeoutMs,
+        cacheSeconds: gateCacheSeconds,
+        maxActionChars: gateMaxActionChars,
+        minConfidence: gateMinConfidence,
+        askInHeadless: gate.askInHeadless as "warn" | "block",
+      },
+    },
     economy: { stickyFollowUps: economy.stickyFollowUps !== false, followUpMaxChars: economy.followUpMaxChars as number },
     logging: { enabled: logging.enabled !== false, path: logging.path as string },
+    verify: {
+      enabled: verify.enabled === true,
+      minConfidence: verifyMinConfidence,
+      maxContinuations: verifyMaxContinuations,
+      maxAnswerChars: verifyMaxAnswerChars,
+      skipTrivial: verify.skipTrivial !== false,
+    },
+    cascade: {
+      enabled: cascade.enabled === true,
+      minConfidence: cascadeMinConfidence,
+      targets: cascadeResolved,
+      maxTaskChars: cascadeMaxTaskChars,
+    },
   };
 }
 
@@ -527,6 +660,166 @@ function probability(response: JevResponse, id: string): number {
   return answer?.type === "noul" && typeof answer.noul === "number" ? answer.noul : 0;
 }
 
+// Choice answers carry a confidence; Noul answers do not. Missing means "no calibration data",
+// which must not be read as low confidence — the threshold only applies when Jev reported one.
+function confidence(response: JevResponse, id: string): number | undefined {
+  const value = response.answers?.[id]?.confidence;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+// Irreversibility above this forces a human decision even when the verdict says allow.
+const IRREVERSIBLE_ASK = 0.5;
+
+// Choice verdict + Noul irreversibility, composed as the article suggests: probability says what,
+// the Noul/confidence says whether to trust it. Both low confidence and irreversibility degrade to
+// "ask"; only a confident "deny" denies, and the deterministic regex still owns the hard denies.
+function gateVerdict(response: JevResponse, minConfidence: number): GateDecision {
+  const verdict = pick(response, "verdict", GATE_VERDICTS, "ask");
+  const score = confidence(response, "verdict");
+  const irreversible = probability(response, "irreversible");
+  const unsure = score !== undefined && score < minConfidence;
+  return { verdict: unsure || irreversible >= IRREVERSIBLE_ASK ? "ask" : verdict, confidence: score, irreversible };
+}
+
+// One request per graded assignment; below the threshold the spawn keeps whatever omp resolved.
+function cascadeTarget(response: JevResponse, cfg: Config, minConfidence: number): Target | undefined {
+  const score = confidence(response, "difficulty");
+  if (score !== undefined && score < minConfidence) return undefined;
+  return cfg.cascade.targets[pick(response, "difficulty", DIFFICULTIES, "medium")];
+}
+
+const VERIFY_VERDICTS = ["done", "incomplete", "wrong_scope"] as const;
+const VERIFY_NUDGE: Record<string, string> = {
+  incomplete: "Jev verifier: the request is not fully satisfied yet. Finish the remaining work, then report what changed.",
+  wrong_scope: "Jev verifier: the work drifted from the request. Re-read the request, drop out-of-scope changes, and answer what was asked.",
+};
+
+// Verification needs both primitives to agree: the Choice verdict and the Noul "complete".
+// Disagreement means "no signal" — never force another turn on a coin flip.
+function verifyOutcome(response: JevResponse, minConfidence: number): { action: "continue" | "none"; verdict: string; confidence?: number; complete: number } {
+  const verdict = pick(response, "verdict", VERIFY_VERDICTS, "done");
+  const score = confidence(response, "verdict");
+  const complete = probability(response, "complete");
+  const confident = score === undefined || score >= minConfidence;
+  const action = verdict !== "done" && complete < 0.5 && confident ? "continue" : "none";
+  return { action, verdict, confidence: score, complete };
+}
+
+// What the gate is allowed to show Jev: a shell command, or the target path of a write.
+// File contents and tool results never leave the machine, and secrets are redacted before sending.
+function actionOf(toolName: string, input: unknown): string | undefined {
+  const args = asRecord(input);
+  if (toolName === "bash") {
+    const command = args.command;
+    return typeof command === "string" && command.trim() ? `bash: ${command}` : undefined;
+  }
+  const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : undefined;
+  return path ? `${toolName}: ${path}` : undefined;
+}
+
+function redactAction(action: string, maxChars: number): string {
+  return action
+    .replace(/\b(authorization|auth|proxy-authorization)\s*[:=]\s*(?:bearer\s+)?\S+/gi, "$1=[REDACTED]")
+    .replace(/\bbearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(/\b(token|password|passwd|secret|api[-_]?key|apikey)\b\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/(--?(?:token|password|passwd|secret|api[-_]?key|apikey|auth)\b[= ]\s*)\S+/gi, "$1[REDACTED]")
+    .replace(/\b([A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Za-z0-9_]*)=[^\s"']+/g, "$1=[REDACTED]")
+    .replace(/(:\/\/[^/\s:@]+):[^@\s/]+@/g, "$1:[REDACTED]@")
+    .replace(/\b[A-Za-z0-9+/_-]{32,}={0,2}\b/g, "[REDACTED]")
+    .slice(0, maxChars);
+}
+
+const GATE_LABEL: Record<GateVerdict, string> = { allow: "allow", ask: "ask (ambíguo)", deny: "deny (perigoso)" };
+
+// The spawn event carries no assignment text, so the parent's `task` tool call records the items and
+// the spawn is matched back by item name (spawnKey) or, when omp generated the name, by spawn order.
+function recordPendingSpawns(sessionId: string, input: unknown): void {
+  const args = asRecord(input);
+  const raw = Array.isArray(args.tasks) ? args.tasks : typeof args.task === "string" ? [args] : [];
+  const items: PendingSpawn[] = [];
+  for (const item of raw) {
+    const record = asRecord(item);
+    const text = typeof record.task === "string" ? record.task : undefined;
+    if (!text) continue;
+    items.push({ key: typeof record.name === "string" ? record.name : undefined, text, at: Date.now() });
+  }
+  if (items.length > 0) {
+    // A second `task` call replaces the list: parallel calls in one message lose their item text
+    // (that spawn then keeps whatever omp resolved) instead of risking the wrong text on a spawn.
+    pendingSpawns.set(sessionId, items.slice(0, PENDING_SPAWN_MAX));
+  }
+}
+
+function takePendingSpawn(sessionId: string, spawnKey: string | undefined): string | undefined {
+  const now = Date.now();
+  const live = (pendingSpawns.get(sessionId) ?? []).filter((item) => now - item.at < PENDING_SPAWN_TTL_MS);
+  if (live.length === 0) {
+    pendingSpawns.delete(sessionId);
+    return undefined;
+  }
+  const named = spawnKey === undefined ? -1 : live.findIndex((item) => item.key === spawnKey);
+  const [taken] = live.splice(named >= 0 ? named : 0, 1);
+  pendingSpawns.set(sessionId, live);
+  return taken?.text;
+}
+
+function squeeze(text: string): string {
+  return normalize(text).replace(/\s+/g, " ").trim();
+}
+
+// The child re-enters routing on its own first prompt with the same assignment text; the hash marker
+// tells the router the cascade already decided, so it neither re-triages nor switches mid-run.
+function markCascadeHandoff(assignment: string): void {
+  const key = squeeze(assignment).slice(0, 120);
+  if (!key) return;
+  cascadeHandoffs.set(key, { at: Date.now() });
+}
+
+function consumeCascadeHandoff(prompt: string): boolean {
+  const haystack = squeeze(prompt);
+  const now = Date.now();
+  for (const [key, value] of cascadeHandoffs) {
+    if (now - value.at > HANDOFF_TTL_MS) {
+      cascadeHandoffs.delete(key);
+      continue;
+    }
+    if (key && haystack.includes(key)) {
+      cascadeHandoffs.delete(key);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Spawn patterns carry the thinking level too (`provider/id:level`), so the child starts on the
+// target's configured level instead of the agent's default.
+function thinkingSpecFor(cfg: Config, target: Target): string {
+  const spec = cfg.targets[target]?.thinking ?? "medium";
+  return typeof spec === "string" ? spec : spec.default ?? spec.medium ?? spec.high ?? "medium";
+}
+
+// The final answer is the only message the verifier sees, and only its text blocks.
+function assistantText(message: unknown): string {
+  const content = asRecord(message).content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((block) => {
+      const record = asRecord(block);
+      return record.type === "text" && typeof record.text === "string" ? record.text : "";
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function resetDecisionMaps(): void {
+  gateCache.clear();
+  pendingSpawns.clear();
+  cascadeHandoffs.clear();
+  verifyUsed.clear();
+}
+
 async function registryKey(ctx: RuntimeContext, cfg: Config, forceRefresh: boolean): Promise<string | undefined> {
   if (!forceRefresh && keyCache && keyCache.expiresAt > Date.now()) return keyCache.value;
   const sessionId = ctx.sessionManager?.getSessionId?.();
@@ -548,9 +841,9 @@ async function apiCandidates(ctx: RuntimeContext, cfg: Config, forceRefresh: boo
   return out;
 }
 
-async function postJev(cfg: Config, key: string, state: unknown, questions: Record<string, unknown>): Promise<Response> {
+async function postJev(cfg: Config, key: string, state: unknown, questions: Record<string, unknown>, timeoutMs = cfg.jev.timeoutMs): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cfg.jev.timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(cfg.jev.endpoint, {
       method: "POST",
@@ -569,7 +862,7 @@ function openAuthBreaker(accountDead: boolean): void {
   authBlockedUntil = Date.now() + authDelayMs(authFailures);
 }
 
-async function callJev(ctx: RuntimeContext, cfg: Config, state: unknown, questions: Record<string, unknown>): Promise<JevResponse> {
+async function callJev(ctx: RuntimeContext, cfg: Config, state: unknown, questions: Record<string, unknown>, timeoutMs?: number): Promise<JevResponse> {
   // Elapsed backoff means the next real triage is the half-open probe: let it through.
   if (Date.now() < authBlockedUntil) throw new Error("Jev auth circuit breaker active");
   const tried: Record<string, true> = {};
@@ -582,7 +875,7 @@ async function callJev(ctx: RuntimeContext, cfg: Config, state: unknown, questio
     for (const key of candidates) {
       if (tried[key]) continue;
       tried[key] = true;
-      const response = await postJev(cfg, key, state, questions);
+      const response = await postJev(cfg, key, state, questions, timeoutMs);
       if (response.status !== 401 && response.status !== 403) {
         const text = await response.text();
         if (!response.ok) throw new Error(`Jev HTTP ${response.status}: ${text.slice(0, 160)}`);
@@ -638,6 +931,53 @@ const TRIAGE_QUESTIONS = {
       low: "Reversible local change",
       medium: "Dependencies, permissions, or meaningful regression potential",
       high: "Secrets, production, security, destructive, or external side effects",
+    },
+  },
+};
+
+// The gate sees the redacted action plus the current request — never file contents or tool output.
+const GATE_QUESTIONS = {
+  verdict: {
+    type: "choice",
+    instructions: "Decide what the harness must do with this proposed action from a coding agent.",
+    criteria: {
+      allow: "Plainly safe and inside the requested work. Run it.",
+      ask: "Consequential, out of the requested scope, or unclear. A human decides.",
+      deny: "Plainly dangerous or unrelated to the requested work. Block it.",
+    },
+  },
+  irreversible: {
+    type: "noul",
+    instructions: "The action is irreversible, destroys data, exfiltrates a credential, or touches production state.",
+  },
+};
+
+// Cascade: grade the assignment, the spawn starts on the matching target's model.
+const CASCADE_QUESTIONS = {
+  difficulty: {
+    type: "choice",
+    instructions: "Grade the reasoning effort the subagent running this assignment actually needs.",
+    criteria: {
+      easy: "Mechanical: read, list, count, format, or transcribe.",
+      medium: "Localized work with judgment: a few files, one focused check, a small refactor.",
+      hard: "Cross-cutting, architectural, risky, or long-horizon work.",
+    },
+  },
+};
+
+// Verification sees the request and the final text only; both primitives must agree before a retry.
+const VERIFY_QUESTIONS = {
+  complete: {
+    type: "noul",
+    instructions: "The final answer fully satisfies the user's request, with no promised work left undone.",
+  },
+  verdict: {
+    type: "choice",
+    instructions: "Judge the final answer against the request it answers.",
+    criteria: {
+      done: "The request is satisfied and the answer says what was done.",
+      incomplete: "Part of the request is unfinished or only promised.",
+      wrong_scope: "The work answers something else, or changed what was not asked for.",
     },
   },
 };
@@ -760,6 +1100,23 @@ export const __jevRouterTest = {
   TASK_TYPES,
   COMPLEXITIES,
   RISKS,
+  // Gate / cascade / verify decision points.
+  confidence,
+  redactAction,
+  actionOf,
+  gateVerdict,
+  cascadeTarget,
+  verifyOutcome,
+  thinkingSpecFor,
+  assistantText,
+  recordPendingSpawns,
+  takePendingSpawn,
+  markCascadeHandoff,
+  consumeCascadeHandoff,
+  resetDecisionMaps,
+  gateCacheSize: () => gateCache.size,
+  GATE_VERDICTS,
+  DIFFICULTIES,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -810,6 +1167,12 @@ export default function (pi: ExtensionAPI) {
     const prompt = rawPrompt?.trim();
     if (!cfg || !cfg.enabled || !enabled || !prompt || prompt.startsWith(CONTINUATION_PREFIX)) return;
     const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
+    // A child whose model the cascade already chose keeps it: same classification, one fewer request.
+    if (cfg.cascade.enabled && consumeCascadeHandoff(prompt)) {
+      logEvent(cfg, { kind: "cascade-handoff", prompt_hash: hash(prompt) });
+      ctx.ui?.setStatus?.("jev-router", "cascade");
+      return;
+    }
     const previous = turns.get(sessionId);
     if (previous?.prompt === prompt) return;
 
@@ -877,24 +1240,164 @@ export default function (pi: ExtensionAPI) {
     // No system-prompt injection: a per-turn change would bust the cached prompt prefix every turn.
   }
 
+  // Deterministic first (the regex owns hard blocks), then Jev on what the regex left alone.
   pi.on("tool_call", async (event: { toolName: string; input: unknown }, ctx: RuntimeContext) => {
     const cfg = loadConfig();
-    if (!cfg || !cfg.enabled || !enabled || !cfg.safety.enabled || !cfg.safety.tools.includes(event.toolName)) return;
-    const reason = dangerousCall(event.toolName, event.input);
-    if (!reason) return;
-    // Local-only check: tool input is never sent to Jev, so secrets stay on this machine.
-    logEvent(cfg, { kind: "safety", tool: event.toolName, mode: cfg.safety.mode, reason, input_hash: hash(safeInputText(event.input)) });
-    if (cfg.safety.mode === "enforce") {
-      notify(ctx, `Jev Router bloqueou: ${reason} via ${event.toolName}.`, "warning");
-      return { block: true, reason: `Jev Router bloqueou: ${reason} via ${event.toolName}.` };
+    if (!cfg || !cfg.enabled || !enabled) return;
+    const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
+    // The parent's task call is where the assignment text exists; remember it for the spawn event.
+    if (cfg.cascade.enabled && event.toolName === "task") {
+      recordPendingSpawns(sessionId, event.input);
+      return;
     }
-    notify(ctx, `Jev Router [shadow, não bloqueou]: ${reason} via ${event.toolName}. Revise o comando antes de executar.`, "warning");
+    if (!cfg.safety.enabled || !cfg.safety.tools.includes(event.toolName)) return;
+    const reason = dangerousCall(event.toolName, event.input);
+    if (reason) {
+      logEvent(cfg, { kind: "safety", tool: event.toolName, mode: cfg.safety.mode, reason, input_hash: hash(safeInputText(event.input)) });
+      if (cfg.safety.mode === "enforce") {
+        notify(ctx, `Jev Router bloqueou: ${reason} via ${event.toolName}.`, "warning");
+        return { block: true, reason: `Jev Router bloqueou: ${reason} via ${event.toolName}.` };
+      }
+      notify(ctx, `Jev Router [shadow, não bloqueou]: ${reason} via ${event.toolName}. Revise o comando antes de executar.`, "warning");
+      return;
+    }
+
+    const gate = cfg.safety.jev;
+    if (!gate.enabled || !gate.tools.includes(event.toolName)) return;
+    const action = actionOf(event.toolName, event.input);
+    if (!action) return;
+    // Only the redacted action plus the current request leaves the machine — never file contents,
+    // tool results, or the transcript. The request was already sent once by the routing triage.
+    const redacted = redactAction(action, gate.maxActionChars);
+    const key = cacheKey(redacted);
+    const cached = gateCache.get(key);
+    let decision: GateDecision;
+    if (cached && Date.now() - cached.at < gate.cacheSeconds * 1000) {
+      decision = cached.decision;
+    } else {
+      const startedAt = Date.now();
+      // With the auth breaker open every gateable call would fail the same way: warn once per outage.
+      const blockedBefore = Date.now() < authBlockedUntil;
+      try {
+        const response = await callJev(ctx, cfg, {
+          request: (turns.get(sessionId)?.prompt ?? "").slice(0, cfg.jev.maxPromptChars),
+          tool: event.toolName,
+          action: redacted,
+        }, GATE_QUESTIONS, gate.timeoutMs);
+        decision = gateVerdict(response, gate.minConfidence);
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        logEvent(cfg, { kind: "safety-jev", tool: event.toolName, mode: cfg.safety.mode, verdict: "error", error: lastError.slice(0, 160), action_hash: key, latency_ms: Date.now() - startedAt }, true);
+        // Fail open: the deterministic layer already ran, and a Jev outage must not stall ordinary
+        // work. The auth breaker keeps a dead credential from being retried on every tool call.
+        if (!blockedBefore) notify(ctx, `Jev Router: gate indisponível (${fallbackCause(lastError)}). Vale a regra local para ${event.toolName}.`, "warning");
+        return;
+      }
+      gateCache.set(key, { decision, at: Date.now() });
+      if (gateCache.size > JEV_CACHE_MAX) gateCache.delete(gateCache.keys().next().value as string);
+      logEvent(cfg, {
+        kind: "safety-jev", tool: event.toolName, mode: cfg.safety.mode, ...decision,
+        flagged: decision.verdict !== "allow", action_hash: key, latency_ms: Date.now() - startedAt,
+      }, true);
+    }
+
+    const detail = `${GATE_LABEL[decision.verdict]}${decision.irreversible >= IRREVERSIBLE_ASK ? `, irreversível ${decision.irreversible.toFixed(2)}` : ""}${decision.confidence === undefined ? "" : `, confiança ${decision.confidence.toFixed(2)}`}`;
+    const blockReason = `Jev Router bloqueou (${detail}) via ${event.toolName}: ${redacted.slice(0, 200)}`;
+    if (cfg.safety.mode === "shadow") {
+      notify(ctx, `Jev Router [shadow]: ${detail} via ${event.toolName} — ${redacted.slice(0, 120)}`);
+      return;
+    }
+    if (decision.verdict === "allow") return;
+    if (decision.verdict === "deny") {
+      notify(ctx, blockReason, "warning");
+      return { block: true, reason: blockReason };
+    }
+    // Ambiguous: the article's human-in-the-loop band. With a UI, ask; headless decides by config.
+    if (ctx.hasUI && ctx.ui?.confirm) {
+      const allowed = await ctx.ui.confirm("Jev Router: confirmação necessária", `${blockReason}\n\nExecutar mesmo assim?`).catch(() => false);
+      if (!allowed) return { block: true, reason: `Jev Router: ação recusada no prompt (${detail}).` };
+      return;
+    }
+    if (gate.askInHeadless === "block") {
+      notify(ctx, blockReason, "warning");
+      return { block: true, reason: blockReason };
+    }
+    notify(ctx, `Jev Router [headless, não bloqueou]: ${detail} via ${event.toolName} — ${redacted.slice(0, 120)}`, "warning");
+    return { additionalContext: `Jev gate: "${redacted.slice(0, 200)}" é ambíguo (${detail}). Confirme que está no escopo do pedido; se não estiver, explique em vez de executar.` };
+  });
+
+  // Pattern D: grade the assignment once, before the child starts, and let it start on that model.
+  pi.on("before_subagent_spawn", async (event: { agent?: string; invocationKind?: string; spawnKey?: string }, ctx: RuntimeContext) => {
+    const cfg = loadConfig();
+    if (!cfg || !cfg.enabled || !enabled || !cfg.cascade.enabled) return;
+    const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
+    const assignment = takePendingSpawn(sessionId, event.spawnKey);
+    if (!assignment) return;
+    const startedAt = Date.now();
+    try {
+      const response = await callJev(ctx, cfg, {
+        assignment: assignment.slice(0, cfg.cascade.maxTaskChars),
+        agent: event.agent ?? "",
+        invocation: event.invocationKind ?? "",
+      }, CASCADE_QUESTIONS, cfg.safety.jev.timeoutMs);
+      const difficulty = pick(response, "difficulty", DIFFICULTIES, "medium");
+      const target = cascadeTarget(response, cfg, cfg.cascade.minConfidence);
+      logEvent(cfg, { kind: "cascade", agent: event.agent, spawn_key: event.spawnKey, difficulty, target: target ?? null, confidence: confidence(response, "difficulty"), latency_ms: Date.now() - startedAt }, true);
+      if (!target) return;
+      const specs = cfg.targets[target]?.models ?? [];
+      if (specs.length === 0) return;
+      // The child would otherwise re-triage its own first prompt and switch away from this choice.
+      markCascadeHandoff(assignment);
+      const level = thinkingSpecFor(cfg, target);
+      notify(ctx, `Jev Router: subagente ${event.spawnKey ?? event.agent ?? "?"} em ${target} (${difficulty}, thinking ${level}).`);
+      return { model: specs.map((spec) => `${spec}:${level}`), note: `Jev cascade: ${difficulty} → ${target}` };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      logEvent(cfg, { kind: "cascade", agent: event.agent, spawn_key: event.spawnKey, error: lastError.slice(0, 160), latency_ms: Date.now() - startedAt }, true);
+      // No override: the spawn keeps whatever omp resolved.
+      return;
+    }
+  });
+
+  // Pattern C: verify the finished answer, and ask for one more pass only when Jev is sure.
+  pi.on("session_stop", async (event: { last_assistant_message?: unknown; stop_hook_active?: boolean; session_id?: string }, ctx: RuntimeContext) => {
+    const cfg = loadConfig();
+    if (!cfg || !cfg.enabled || !enabled || !cfg.verify.enabled) return;
+    if (event.stop_hook_active) return;
+    const sessionId = event.session_id ?? ctx.sessionManager?.getSessionId?.() ?? "default";
+    if ((verifyUsed.get(sessionId) ?? 0) >= cfg.verify.maxContinuations) return;
+    const turn = turns.get(sessionId);
+    if (!turn) return;
+    const request = turn.prompt.trim();
+    if (!request) return;
+    if (cfg.verify.skipTrivial && (turn.decision.complexity === "trivial" || turn.decision.type === "other")) return;
+    const answer = assistantText(event.last_assistant_message);
+    if (!answer) return;
+    const startedAt = Date.now();
+    try {
+      const response = await callJev(ctx, cfg, {
+        request: request.slice(0, cfg.jev.maxPromptChars),
+        answer: answer.slice(0, cfg.verify.maxAnswerChars),
+      }, VERIFY_QUESTIONS);
+      const outcome = verifyOutcome(response, cfg.verify.minConfidence);
+      logEvent(cfg, { kind: "verify", prompt_hash: hash(request), ...outcome, latency_ms: Date.now() - startedAt }, true);
+      if (outcome.action !== "continue") return;
+      verifyUsed.set(sessionId, (verifyUsed.get(sessionId) ?? 0) + 1);
+      notify(ctx, `Jev Router: verificação ${outcome.verdict} (complete ${outcome.complete.toFixed(2)}${outcome.confidence === undefined ? "" : `, confiança ${outcome.confidence.toFixed(2)}`}); pedindo uma passada extra.`, "warning");
+      return { continue: true, additionalContext: VERIFY_NUDGE[outcome.verdict] ?? VERIFY_NUDGE.incomplete };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      logEvent(cfg, { kind: "verify", error: lastError.slice(0, 160), latency_ms: Date.now() - startedAt }, true);
+      // A broken verifier never holds the turn open.
+      return;
+    }
   });
 
   pi.on("session_start", async (_event: unknown, ctx: RuntimeContext) => {
     enabled = true;
     const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
     turns.delete(sessionId);
+    verifyUsed.delete(sessionId);
     ctx.ui?.setStatus?.("jev-router", "ready");
   });
   pi.registerCommand("jev-router", {
@@ -905,11 +1408,19 @@ export default function (pi: ExtensionAPI) {
         configStamp = "";
         reportedIssuesStamp = "";
         jevCache.clear();
+        resetDecisionMaps();
         resetAuthState();
       }
       const cfg = loadConfig();
       const sessionId = ctx.sessionManager?.getSessionId?.() ?? "default";
       const invalid = configIssues.length > 0 ? `\nConfig inválida:\n- ${configIssues.join("\n- ")}` : "";
+      const features = cfg
+        ? [
+          `gate: ${cfg.safety.jev.enabled ? cfg.safety.mode : "off"}`,
+          `verify: ${cfg.verify.enabled ? `on (${cfg.verify.maxContinuations} passada${cfg.verify.maxContinuations === 1 ? "" : "s"})` : "off"}`,
+          `cascade: ${cfg.cascade.enabled ? `on (${DIFFICULTIES.map((d) => `${d}→${cfg.cascade.targets[d]}`).join(" ")})` : "off"}`,
+        ].join(" · ")
+        : "sem config";
       if (command === "on" || command === "off") {
         enabled = command === "on";
         notify(ctx, enabled ? "Jev Router ativado: próximas mensagens passam por triagem." : "Jev Router desativado: modelo atual mantido até reativar.");
@@ -920,6 +1431,7 @@ export default function (pi: ExtensionAPI) {
           ? [
             `jev: ${cfg.jev.provider} · ${cfg.jev.model}`,
             `providers permitidos: ${cfg.providers.allow.length > 0 ? cfg.providers.allow.join(", ") : "qualquer"}`,
+            `decisões extra: ${features}`,
             "rotas (primeira que casar vence):",
             ...cfg.routes.map((route, i) => {
               const when = route.when
@@ -984,8 +1496,8 @@ export default function (pi: ExtensionAPI) {
         const last = turn?.decision;
         const pendingNote = turn?.pendingTarget !== undefined ? ` · ${turn.pendingTarget} sugerido (${turn.pendingCount}/2)` : "";
         notify(ctx, last
-          ? `${last.target} (${thinkingFor(cfg, last)}) · ${last.type}/${last.complexity}/${last.risk} · ${last.agent} · origem ${last.source} · ferramenta ${last.tool ?? "nenhuma"}${pendingNote}${authNote}${invalid}`
-          : `Jev Router: nenhuma decisão ainda${authNote}. Envie uma mensagem ou rode /jev-router test <prompt>.${invalid}`);
+          ? `${last.target} (${thinkingFor(cfg, last)}) · ${last.type}/${last.complexity}/${last.risk} · ${last.agent} · origem ${last.source} · ferramenta ${last.tool ?? "nenhuma"}${pendingNote}${authNote}\n${features}${invalid}`
+          : `Jev Router: nenhuma decisão ainda${authNote}. Envie uma mensagem ou rode /jev-router test <prompt>.\n${features}${invalid}`);
       } else {
         notify(ctx, "Uso: /jev-router [status | on | off | reload | config | models | available [provider] | test <prompt> | history | rewind]");
       }
