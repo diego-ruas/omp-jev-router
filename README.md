@@ -143,6 +143,28 @@ Both `safety.jev` and `verify` send data that the routing triage does not: the r
 
 Swapping a model version is a one-line change to `targets.<name>.models`; listing a second spec gives a fallback when the first is not registered.
 
+## When Jev stops answering
+
+The triage client tries, in order: the credential omp has for `jev.provider`, then `OPENROUTER_API_KEY` (openrouter only), then `JEV_API_KEY` — and it remembers the candidate that worked, so a rejected one is not paid for twice in the same process. A `401`/`403` is the common case, and the notification names it.
+
+omp can hold **several credentials for one provider** and resolve them `ORDER BY id ASC`, so a stale key with a low id can be the one handed to the router. Two ways out:
+
+1. `OPENROUTER_API_KEY=<chave boa>` in the shell — tried right after the registry candidate.
+2. Disable the stale credential in the store (reversible, needs no UI button):
+
+```python
+# backup primeiro: sqlite3 backup API grava uma cópia consistente (inclui o WAL)
+import sqlite3, pathlib, time
+db = pathlib.Path.home()/".omp/agent/agent.db"
+con = sqlite3.connect(db)
+with con:
+    con.execute("UPDATE auth_credentials SET disabled_cause = ?, updated_at = ? "
+                "WHERE provider='openrouter' AND id = ? AND disabled_cause IS NULL",
+                ("stale key: 401 User not found", int(time.time()), 5))
+```
+
+The resolver's own query filters `disabled_cause IS NULL`, so a non-null value hides the row; `/login` shows it as disabled with that cause. Set the column back to `NULL` to undo. Always take the backup — `backups/` sits next to `agent.db`.
+
 ## Layout
 
 - `extensions/jev-router.ts` — the extension (registered via `omp.extensions` in `package.json`)
