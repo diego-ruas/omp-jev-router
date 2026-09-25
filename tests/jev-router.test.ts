@@ -10,7 +10,7 @@ const {
   confidence, redactAction, actionOf, gateVerdict, cascadeTarget, verifyOutcome, thinkingSpecFor,
   assistantText, recordPendingSpawns, takePendingSpawn, markCascadeHandoff, consumeCascadeHandoff,
   resetDecisionMaps, DIFFICULTIES, prepareRoutes, candidatesFingerprint, validateRoute,
-  fallbackCode, exactInput, configStampForTest, cacheableGate, classifyModelChange,
+  fallbackCode, exactInput, configStampForTest, cacheableGate, classifyModelChange, candidateDescription, routeQuestion, pickCandidate,
 } = T;
 
 type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
@@ -672,5 +672,69 @@ describe("classifyModelChange: revert do host não é escolha do usuário", () =
   });
   test("sem switch anterior não há o que comparar", () => {
     expect(classifyModelChange({}, "anthropic/claude-opus-5-5")).toBe("same");
+  });
+});
+
+describe("seleção direta por ID (decision.mode: select)", () => {
+  const { cfg } = validCfg();
+  const registry = [
+    { provider: "openai-codex", id: "gpt-6-luna" },
+    { provider: "commandcode", id: "meta/muse-spark-1.3-contributor" },
+    { provider: "anthropic", id: "claude-opus-5-5" },
+  ];
+  const ctx = { models: { list: () => registry } };
+  const candidates = prepareRoutes(ctx, cfg);
+  const answer = (choice: string, conf?: number) => ({
+    answers: { route: { type: "choice", choice, ...(conf === undefined ? {} : { confidence: conf }) } },
+  });
+
+  test("o modo shipped segue classify (paridade com a tabela de rotas)", () => {
+    expect(cfg.decision.mode).toBe("classify");
+  });
+  test("as descrições vêm do config, não do código", () => {
+    const luna = candidates.find((c) => c.id === "luna");
+    expect(luna).toBeDefined();
+    expect(candidateDescription(cfg, luna!)).toBe(cfg.targets.luna.description);
+    const semDescricao = { ...cfg, targets: { ...cfg.targets, luna: { models: cfg.targets.luna.models, thinking: "low" } } };
+    expect(candidateDescription(semDescricao, luna!)).toBe("luna: openai-codex/gpt-6-luna");
+  });
+  test("descrição nunca passa de 160 caracteres", () => {
+    const longo = { ...cfg, targets: { ...cfg.targets, luna: { ...cfg.targets.luna, description: "x".repeat(400) } } };
+    expect(candidateDescription(longo, candidates[0]).length).toBe(160);
+  });
+  test("a pergunta carrega exatamente os candidatos preparados", () => {
+    const question = routeQuestion(cfg, candidates) as { route: { criteria: Record<string, string> } };
+    expect(Object.keys(question.route.criteria)).toEqual(candidates.map((c) => c.id));
+    expect(question.route.criteria.muse).toBe(cfg.targets.muse.description);
+  });
+  test("ID preparado e confiante é aceito", () => {
+    expect(pickCandidate(answer("muse", 0.9), candidates, 0.6)).toEqual({ id: "muse" });
+  });
+  test("ID que o host não preparou é invalid_id", () => {
+    expect(pickCandidate(answer("sonnet", 0.9), candidates, 0.6).reason).toBe("invalid_id");
+  });
+  test("resposta ausente ou não-choice é invalid_id", () => {
+    expect(pickCandidate({}, candidates, 0.6).reason).toBe("invalid_id");
+    expect(pickCandidate({ answers: { route: { type: "noul", noul: 0.9 } } }, candidates, 0.6).reason).toBe("invalid_id");
+  });
+  test("abaixo do limiar é abstenção, não seleção", () => {
+    expect(pickCandidate(answer("muse", 0.4), candidates, 0.6).reason).toBe("low_confidence");
+  });
+  test("sem confidence reportada o ID vale", () => {
+    expect(pickCandidate(answer("opus"), candidates, 0.6)).toEqual({ id: "opus" });
+  });
+  test("modo inválido rejeita o arquivo inteiro", () => {
+    const raw = structuredClone(SHIPPED) as unknown as Record<string, unknown>;
+    (raw.decision as { mode: string }).mode = "automatico";
+    const issues: string[] = [];
+    expect(validateConfig(raw, issues)).toBeUndefined();
+    expect(issues.join("\n")).toMatch(/decision\.mode/);
+  });
+  test("description vazia ou longa demais rejeita o arquivo", () => {
+    const raw = structuredClone(SHIPPED) as unknown as Record<string, unknown>;
+    (raw.targets as Record<string, { description?: string }>).muse.description = "  ";
+    const issues: string[] = [];
+    expect(validateConfig(raw, issues)).toBeUndefined();
+    expect(issues.join("\n")).toMatch(/targets\.muse\.description/);
   });
 });

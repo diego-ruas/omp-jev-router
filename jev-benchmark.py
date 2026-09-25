@@ -129,6 +129,11 @@ for key, value in counts("target").most_common():
     print(f"  {key:14} {value}")
 
 print()
+print("Modes:")
+for key, value in Counter(r.get("mode", "n/a") for r in routing).most_common():
+    print(f"  {key:14} {value}")
+
+print()
 print("Agents:")
 for key, value in counts("agent").most_common():
     print(f"  {key:14} {value}")

@@ -10,6 +10,9 @@
     "minConfidence": 0.6,
     "decisionTtlMs": 45000
   },
+  "decision": {
+    "mode": "classify"
+  },
   "providers": {
     "allow": [
       "openai-codex",
@@ -22,13 +25,15 @@
       "models": [
         "openai-codex/gpt-6-luna"
       ],
-      "thinking": "low"
+      "thinking": "low",
+      "description": "trivial edits and mechanical changes: fast and cheap"
     },
     "muse": {
       "models": [
         "commandcode/meta/muse-spark-1.3-contributor"
       ],
-      "thinking": "low"
+      "thinking": "low",
+      "description": "default low-risk work: cheap, reads and answers"
     },
     "sol": {
       "models": [
@@ -37,25 +42,29 @@
       "thinking": {
         "high": "high",
         "default": "medium"
-      }
+      },
+      "description": "code review and risky changes: strong reasoning"
     },
     "deepseek": {
       "models": [
         "commandcode/deepseek/deepseek-v4.1-flash"
       ],
-      "thinking": "low"
+      "thinking": "low",
+      "description": "research and long-context reading: cheap, large window"
     },
     "opus": {
       "models": [
         "anthropic/claude-opus-5-5"
       ],
-      "thinking": "medium"
+      "thinking": "medium",
+      "description": "planning and high-complexity work: strongest"
     },
     "sonnet": {
       "models": [
         "anthropic/claude-sonnet-5"
       ],
-      "thinking": "medium"
+      "thinking": "medium",
+      "description": "UI and visual design work"
     }
   },
   "routes": [

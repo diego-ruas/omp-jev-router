@@ -73,7 +73,8 @@ Edits are picked up on the next prompt (mtime check); `/jev-router reload` also 
 |---|---|
 | `jev` | Triage classifier: `provider` (credential lookup), `endpoint`, `model`, `timeoutMs`, `cacheSeconds`, `maxPromptChars`, `minConfidence` (abstention threshold), `decisionTtlMs` (prepared-decision expiry) |
 | `providers.allow` | Providers targets may use; a target model outside it is a config error. `[]` = any |
-| `targets.<name>` | `models`: ordered `provider/id` fallbacks (first one in the omp registry wins, exact provider). `thinking`: `off \| minimal \| low \| medium \| high \| xhigh \| max`, or per risk `{ "high": "high", "default": "medium" }` |
+| `targets.<name>` | `models`: ordered `provider/id` fallbacks (first one in the omp registry wins, exact provider). `thinking`: `off \| minimal \| low \| medium \| high \| xhigh \| max`, or per risk `{ "high": "high", "default": "medium" }`. `description` (optional, ≤160 chars): the text the selector reads for this candidate |
+| `decision.mode` | `classify` (default): Jev answers the label questions and the host applies `routes`. `select`: Jev picks one prepared candidate ID instead. With `select` the `routes` table stops choosing the target — it still supplies the deterministic fallback and the labels that map to thinking — so use `classify` when the table is a policy you want enforced (risk → strong model, for instance) |
 | `routes` | Ordered `{ "when": { "type"?, "complexity"?, "risk"? }, "target" }`; first match wins. Lists inside a field are OR, fields are AND. The last route must omit `when` (catch-all) |
 | `safety` | `enabled`, `mode` (`shadow` \| `enforce`), `tools` checked locally |
 | `safety.jev` | Tool gate: `enabled`, `tools` (only these are sent, redacted), `timeoutMs`, `cacheSeconds`, `maxActionChars`, `minConfidence`, `askInHeadless` (`warn` \| `block`) |
@@ -110,7 +111,7 @@ Both `safety.jev` and `verify` send data that the routing triage does not: the r
 
 | Keel rule | Here |
 |---|---|
-| The selector picks from host-prepared options | Routing sends the reachable, registry-resolvable targets as candidate IDs in the request state; the labels it may return are the host's own enums |
+| The selector picks from host-prepared options | Routing sends the reachable, registry-resolvable targets as candidate IDs with host-authored descriptions. With `decision.mode: "select"` the answer *is* one of those IDs (`routeQuestion()` turns them into the choice criteria), so the answer space is exactly what the host can dispatch; with the default `classify` the labels are the host's enums and `routes` maps them |
 | Re-validate the selection before applying | `validateRoute()` rechecks `invalid_id`, `stale_revision` (config stamp changed), `expired` (`jev.decisionTtlMs`), `stale_read_set` (candidate fingerprint changed) and `unauthorized` (payload no longer dispatchable). A rejection falls back — never applies |
 | Abstention is an answer | `jev.minConfidence` (routing abstains to the deterministic heuristic), `safety.jev.minConfidence` (gate degrades to `ask`), `cascade.minConfidence` (spawn keeps omp's model), `verify.minConfidence` (no extra pass) |
 | A selector result never grants permission | The gate can only *add* an objection: it blocks or annotates inside `tool_call`. OMP's approval path is untouched, and a Jev `allow` is never an authorization |
