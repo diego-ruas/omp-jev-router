@@ -10,7 +10,8 @@ const {
   confidence, redactAction, actionOf, gateVerdict, cascadeTarget, verifyOutcome, thinkingSpecFor,
   assistantText, recordPendingSpawns, takePendingSpawn, markCascadeHandoff, consumeCascadeHandoff,
   resetDecisionMaps, DIFFICULTIES, prepareRoutes, candidatesFingerprint, validateRoute,
-  fallbackCode, exactInput, configStampForTest, cacheableGate, classifyModelChange, candidateDescription, routeQuestion, pickCandidate,
+  fallbackCode, exactInput, configStampForTest, cacheableGate, classifyModelChange, pickConfident,
+  lastGoodKeyForTest, apiCandidates, probabilityMass, DENY_MIN_MASS, candidateDescription, routeQuestion, pickCandidate,
 } = T;
 
 type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
@@ -452,33 +453,51 @@ describe("actionOf: só o necessário, nunca conteúdo de arquivo", () => {
   });
 });
 
-describe("gateVerdict: probabilidade + confiança", () => {
-  const answer = (choice: string, conf?: number) => ({ answers: { verdict: { type: "choice", choice, ...(conf === undefined ? {} : { confidence: conf }) } } });
-  test("allow confiante passa", () => {
-    expect(gateVerdict(answer("allow", 0.95), 0.75).verdict).toBe("allow");
+describe("gateVerdict: massa de probabilidade + irreversibilidade", () => {
+  const choice = (c: string, conf?: number, probs?: Record<string, number>) => ({
+    type: "choice" as const, choice: c,
+    ...(conf === undefined ? {} : { confidence: conf }),
+    ...(probs === undefined ? {} : { probabilities: probs }),
   });
-  test("allow inseguro vira ask", () => {
-    expect(gateVerdict(answer("allow", 0.6), 0.75).verdict).toBe("ask");
+  const response = (verdict: ReturnType<typeof choice>, irreversible: number) => ({
+    answers: { verdict, irreversible: { type: "noul" as const, noul: irreversible } },
   });
-  test("deny confiante bloqueia", () => {
-    expect(gateVerdict(answer("deny", 0.9), 0.75).verdict).toBe("deny");
+
+  test("allow com massa alta e sem irreversibilidade passa", () => {
+    expect(gateVerdict(response(choice("allow", 0.72, { allow: 0.81, ask: 0.14, deny: 0.04 }), 0.08), 0.75).verdict).toBe("allow");
   });
-  test("deny inseguro vira ask (quem decide é humano, não o limiar)", () => {
-    expect(gateVerdict(answer("deny", 0.4), 0.75).verdict).toBe("ask");
+  test("allow de massa baixa vira ask (ex.: git log 0.71)", () => {
+    expect(gateVerdict(response(choice("allow", 0.57, { allow: 0.71, ask: 0.22, deny: 0.07 }), 0.02), 0.75).verdict).toBe("ask");
+  });
+  test("deny confiante E irreversível bloqueia", () => {
+    const d = gateVerdict(response(choice("deny", 0.98, { deny: 0.99, allow: 0, ask: 0.01 }), 0.92), 0.75);
+    expect(d.verdict).toBe("deny");
+    expect(d.mass).toBeCloseTo(0.99, 5);
+  });
+  test("deny sem irreversibilidade é objeção de escopo: vira ask", () => {
+    // Amostra real: "echo hello" fora do pedido → deny 0.95 com noul 0.02. Nunca deve bloquear.
+    expect(gateVerdict(response(choice("deny", 0.92, { deny: 0.95, allow: 0.01 }), 0.02), 0.75).verdict).toBe("ask");
   });
   test("irreversível força ask mesmo com allow confiante", () => {
-    const response = { answers: { verdict: { type: "choice", choice: "allow", confidence: 0.99 }, irreversible: { type: "noul", noul: 0.94 } } };
-    const decision = gateVerdict(response, 0.75);
-    expect(decision.verdict).toBe("ask");
-    expect(decision.irreversible).toBeCloseTo(0.94, 5);
+    const d = gateVerdict(response(choice("allow", 0.99, { allow: 0.99 }), 0.94), 0.75);
+    expect(d.verdict).toBe("ask");
+    expect(d.irreversible).toBeCloseTo(0.94, 5);
+  });
+  test("sem probabilities cai na confiança reportada", () => {
+    expect(gateVerdict(response(choice("allow", 0.6), 0.05), 0.75).verdict).toBe("ask");
+    expect(gateVerdict(response(choice("allow", 0.9), 0.05), 0.75).verdict).toBe("allow");
+  });
+  test("deny sem probabilities exige confiança de deny", () => {
+    expect(gateVerdict(response(choice("deny", 0.95), 0.7), 0.75).verdict).toBe("deny");
+    expect(gateVerdict(response(choice("deny", 0.5), 0.7), 0.75).verdict).toBe("ask");
   });
   test("sem resposta válida o fallback é ask, nunca allow", () => {
     expect(gateVerdict({}, 0.75).verdict).toBe("ask");
-    expect(gateVerdict({ answers: { verdict: { type: "choice", choice: "sei la" } } }, 0.75).verdict).toBe("ask");
+    expect(gateVerdict(response(choice("sei la", 0.99), 0.9), 0.75).verdict).toBe("ask");
   });
-  test("confidence ausente não é lido como baixa confiança", () => {
-    expect(confidence(answer("allow"), "verdict")).toBeUndefined();
-    expect(gateVerdict(answer("allow"), 0.75).verdict).toBe("allow");
+  test("probabilityMass lê a massa da opção escolhida", () => {
+    expect(probabilityMass({ answers: { v: { type: "choice", probabilities: { allow: 0.3 } } } }, "v", "allow")).toBeCloseTo(0.3, 5);
+    expect(probabilityMass({ answers: { v: { type: "choice" } } }, "v", "allow")).toBeUndefined();
   });
 });
 
@@ -736,5 +755,126 @@ describe("seleção direta por ID (decision.mode: select)", () => {
     const issues: string[] = [];
     expect(validateConfig(raw, issues)).toBeUndefined();
     expect(issues.join("\n")).toMatch(/targets\.muse\.description/);
+  });
+});
+
+describe("credencial rotacionada não espera o backoff", () => {
+  const { cfg } = validCfg();
+  const okBody = JSON.stringify({ answers: { task_type: { type: "choice", choice: "coding" } } });
+  const denied = () => new Response('{"error":{"message":"User not found"}}', { status: 401 });
+  const ok = (key: string) => new Response(key === "good-key" ? okBody : '{"error":{"message":"User not found"}}', { status: key === "good-key" ? 200 : 401 });
+
+  function ctxWith(keys: string[]) {
+    let call = 0;
+    return {
+      sessionManager: { getSessionId: () => "s1" },
+      modelRegistry: { getApiKeyForProvider: async () => keys[Math.min(call++, keys.length - 1)] },
+    };
+  }
+  function withFetch(handler: (key: string) => Response, fn: () => Promise<void>) {
+    const orig = globalThis.fetch;
+    // @ts-expect-error mock parcial
+    globalThis.fetch = async (_url: unknown, init: { headers: { Authorization: string } }) => handler(init.headers.Authorization.slice(7));
+    return fn().finally(() => { globalThis.fetch = orig; });
+  }
+
+  test("chave morta abre o breaker; a mesma chave não passa mais", async () => {
+    T.resetAuthState();
+    delete process.env.OPENROUTER_API_KEY; delete process.env.JEV_API_KEY;
+    await withFetch(denied, async () => {
+      await expect(T.callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("401");
+      await expect(T.callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("circuit breaker");
+    });
+    T.resetAuthState();
+  });
+
+  test("chave nova durante o breaker é sondada e destrava a decisão", async () => {
+    T.resetAuthState();
+    delete process.env.OPENROUTER_API_KEY; delete process.env.JEV_API_KEY;
+    await withFetch(denied, async () => {
+      await expect(T.callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("401");
+    });
+    expect(T.authState().blockedUntil).toBeGreaterThan(Date.now());
+    expect(T.authState().rejected).toContain("bad-key");
+    // Usuário troca a credencial: o registry passa a devolver uma chave que este processo não queimou.
+    await withFetch((key) => ok(key), async () => {
+      const res = await T.callJev(ctxWith(["good-key"]), cfg, { request: "x" }, {});
+      expect(res.answers?.task_type).toBeDefined();
+    });
+    expect(T.authState().blockedUntil).toBeLessThanOrEqual(Date.now());
+    T.resetAuthState();
+  });
+});
+
+describe("pickConfident: confiança por campo, não uma só para todos", () => {
+  const answer = (fields: Record<string, { choice: string; confidence?: number }>) => ({
+    answers: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, { type: "choice", ...v }])),
+  });
+  test("label confiante vence o heurístico", () => {
+    expect(pickConfident(answer({ complexity: { choice: "high", confidence: 0.92 } }), "complexity", COMPLEXITIES, "low", 0.6)).toBe("high");
+  });
+  test("label abaixo do limiar cai no valor determinístico daquele campo", () => {
+    expect(pickConfident(answer({ complexity: { choice: "low", confidence: 0.37 } }), "complexity", COMPLEXITIES, "high", 0.6)).toBe("high");
+  });
+  test("task_type confiante não carrega complexity insegura junto", () => {
+    const response = answer({
+      task_type: { choice: "research", confidence: 1 },
+      complexity: { choice: "low", confidence: 0.37 },
+      risk: { choice: "low", confidence: 0.99 },
+    });
+    expect(pickConfident(response, "task_type", TASK_TYPES, "other", 0.6)).toBe("research");
+    expect(pickConfident(response, "complexity", COMPLEXITIES, "medium", 0.6)).toBe("medium");
+    expect(pickConfident(response, "risk", RISKS, "medium", 0.6)).toBe("low");
+  });
+  test("sem confidence reportada o valor do Jev vale", () => {
+    expect(pickConfident(answer({ risk: { choice: "high" } }), "risk", RISKS, "low", 0.6)).toBe("high");
+  });
+  test("valor inválido cai no determinístico mesmo com confidence alta", () => {
+    expect(pickConfident(answer({ risk: { choice: "extremo", confidence: 0.99 } }), "risk", RISKS, "low", 0.6)).toBe("low");
+  });
+});
+
+describe("candidata vencedora é tentada primeiro", () => {
+  const { cfg } = validCfg();
+  const okBody = JSON.stringify({ answers: { task_type: { type: "choice", choice: "coding" } } });
+
+  test("depois de um sucesso com a chave de env, a próxima decisão não paga a chave morta do registry", async () => {
+    T.resetAuthState();
+    process.env.OPENROUTER_API_KEY = "env-good";
+    const seen: string[] = [];
+    const ctx = {
+      sessionManager: { getSessionId: () => "s1" },
+      modelRegistry: { getApiKeyForProvider: async () => "registry-dead" },
+    };
+    const orig = globalThis.fetch;
+    // @ts-expect-error mock parcial
+    globalThis.fetch = async (_url: unknown, init: { headers: { Authorization: string } }) => {
+      const key = init.headers.Authorization.slice(7);
+      seen.push(key);
+      return key === "env-good"
+        ? new Response(okBody, { status: 200 })
+        : new Response('{"error":{"message":"User not found"}}', { status: 401 });
+    };
+    try {
+      await T.callJev(ctx, cfg, { request: "x" }, {});
+      expect(seen).toEqual(["registry-dead", "env-good"]);   // primeira: paga a morta, acha a viva
+      expect(T.lastGoodKeyForTest()).toBe("env-good");
+      seen.length = 0;
+      await T.callJev(ctx, cfg, { request: "y" }, {});
+      expect(seen).toEqual(["env-good"]);                   // segunda: direto na viva
+    } finally {
+      globalThis.fetch = orig;
+      delete process.env.OPENROUTER_API_KEY;
+      T.resetAuthState();
+    }
+  });
+
+  test("a chave vencedora aparece uma vez só na lista de candidatas", async () => {
+    T.resetAuthState();
+    process.env.OPENROUTER_API_KEY = "same-key";
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => "same-key" } };
+    expect(await apiCandidates(ctx, cfg, false)).toEqual(["same-key"]);
+    delete process.env.OPENROUTER_API_KEY;
+    T.resetAuthState();
   });
 });

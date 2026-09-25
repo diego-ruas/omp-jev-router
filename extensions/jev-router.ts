@@ -161,7 +161,7 @@ const JEV_CACHE_MAX = 20;
 const jevCache = new Map<string, { decision: Decision; at: number }>();
 // Gate verdicts keyed by the redacted action only (the request is context, not identity): the same
 // command twice must not cost two requests, and the cache TTL is what bounds staleness.
-type GateDecision = { verdict: GateVerdict; confidence?: number; irreversible: number };
+type GateDecision = { verdict: GateVerdict; confidence?: number; irreversible: number; mass?: number };
 const gateCache = new Map<string, { decision: GateDecision; at: number }>();
 // Assignment text of pending spawns, keyed by session. The spawn event carries no task text, so the
 // cascade reads it from the parent's `task` tool call and matches it back by spawnKey (the item name)
@@ -187,6 +187,13 @@ const HISTORY_MAX = 10;
 // breaker would retry the same dead credential once per session; a per-session key cache would
 // repeat the same refresh in each. Session-scoped state lives in `turns` (keyed by session id).
 let keyCache: { value: string; expiresAt: number } | undefined;
+// Credentials this process already saw rejected. A key in here must not be retried, and a key NOT in
+// here is the signal that the credential rotated while the breaker was open.
+const rejectedKeys = new Set<string>();
+// The credential candidate that last worked, tried first. omp can hold several credentials for one
+// provider and hand out a dead one (observed: 5 openrouter keys, 4 rejected, 1 live), so without
+// this every decision pays a rejected request before reaching the good key.
+let lastGoodKey: string | undefined;
 // Auth breaker with half-open probe: a 401/403 on every credential candidate opens it.
 // After the backoff elapses the next real triage is the probe (no background request); success
 // closes, failure reopens with backoff capped at BREAKER_MAX_MS.
@@ -205,18 +212,25 @@ function authDelayMs(failures: number): number {
 
 function resetAuthState(): void {
   keyCache = undefined;
+  lastGoodKey = undefined;
   authBlockedUntil = 0;
   authFailures = 0;
+  rejectedKeys.clear();
 }
 
 
 function fallbackCause(message: string): string {
   if (/circuit breaker/i.test(message)) {
     const waitS = Math.max(0, Math.ceil((authBlockedUntil - Date.now()) / 1000));
-    return waitS > 0 ? `auth em espera após 401/403 (nova tentativa em ~${waitS}s)` : "auth em espera após 401/403 (nova tentativa na próxima mensagem)";
+    return waitS > 0 ? `auth em espera após 401/403 (nova tentativa em ~${waitS}s; trocou a credencial? /jev-router reload ou OPENROUTER_API_KEY)` : "auth em espera após 401/403 (nova tentativa na próxima mensagem; trocou a credencial? /jev-router reload ou OPENROUTER_API_KEY)";
   }
   if (/credential/i.test(message)) return "sem credencial para o Jev";
   const status = /Jev HTTP (\d+)/.exec(message)?.[1];
+  if (status === "401" || status === "403") {
+    // omp can hold several credentials for one provider and picks among them; the router then falls
+    // back to env candidates, which is the actionable fix when the registry key is a dead one.
+    return `credencial do Jev rejeitada (HTTP ${status}) — defina OPENROUTER_API_KEY/JEV_API_KEY ou remova a credencial morta em Settings → Accounts`;
+  }
   if (status) return `Jev HTTP ${status}`;
   if (/abort|timeout/i.test(message)) return "tempo esgotado";
   return "falha de rede";
@@ -722,6 +736,16 @@ function probability(response: JevResponse, id: string): number {
   return answer?.type === "noul" && typeof answer.noul === "number" ? answer.noul : 0;
 }
 
+// A label is only used when its own confidence clears the threshold; otherwise the deterministic
+// value for that field stands. Measured on the live model: task_type lands at 0.74-1.0, but
+// complexity and risk do dip to 0.37-0.48 on ordinary prompts, and a solid task_type must not
+// launder a 0.37 complexity into the route table.
+function pickConfident<T extends string>(response: JevResponse, id: string, allowed: readonly T[], fallbackValue: T, minConfidence: number): T {
+  const score = confidence(response, id);
+  if (score !== undefined && score < minConfidence) return fallbackValue;
+  return pick(response, id, allowed, fallbackValue);
+}
+
 // Choice answers carry a confidence; Noul answers do not. Missing means "no calibration data",
 // which must not be read as low confidence — the threshold only applies when Jev reported one.
 function confidence(response: JevResponse, id: string): number | undefined {
@@ -729,18 +753,39 @@ function confidence(response: JevResponse, id: string): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+// The probability of the chosen option itself. Calibration on the live model showed this separates
+// decisions (allow 0.71-0.81 vs deny 0.95-1.0 on 7 sample commands) while `confidence` (how
+// concentrated the whole distribution is) stays low on partial splits like allow 0.71/ask 0.22.
+function probabilityMass(response: JevResponse, id: string, choice: string): number | undefined {
+  const value = response.answers?.[id]?.probabilities?.[choice];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 // Irreversibility above this forces a human decision even when the verdict says allow.
 const IRREVERSIBLE_ASK = 0.5;
+// A denial must be both confident and consequential. Sampled on the live model: "echo hello" scored
+// deny 0.95 with an irreversibility of 0.02 (it was merely outside the stated request), while every
+// genuinely destructive sample paired deny >= 0.98 with irreversibility >= 0.59. Without the second
+// signal a deny is a scope objection, and scope is a question for the human, not a block.
+const DENY_MIN_MASS = 0.9;
 
-// Choice verdict + Noul irreversibility, composed as the article suggests: probability says what,
-// the Noul/confidence says whether to trust it. Both low confidence and irreversibility degrade to
-// "ask"; only a confident "deny" denies, and the deterministic regex still owns the hard denies.
+// Verdict + irreversibility composed as the article suggests: the mass says what, the Noul says
+// whether it is consequential, and low confidence degrades to "ask". Only a confident, consequential
+// "deny" denies; the deterministic regex still owns the hard denies.
 function gateVerdict(response: JevResponse, minConfidence: number): GateDecision {
   const verdict = pick(response, "verdict", GATE_VERDICTS, "ask");
   const score = confidence(response, "verdict");
   const irreversible = probability(response, "irreversible");
-  const unsure = score !== undefined && score < minConfidence;
-  return { verdict: unsure || irreversible >= IRREVERSIBLE_ASK ? "ask" : verdict, confidence: score, irreversible };
+  const mass = probabilityMass(response, "verdict", verdict);
+  const base = { confidence: score, irreversible, mass };
+  if (verdict === "deny") {
+    const consequential = irreversible >= IRREVERSIBLE_ASK;
+    const firm = mass === undefined ? score === undefined || score >= DENY_MIN_MASS : mass >= DENY_MIN_MASS;
+    return firm && consequential ? { verdict: "deny", ...base } : { verdict: "ask", ...base };
+  }
+  // No reported mass means no calibration data: fall back to the concentration, the same rule as before.
+  const unsure = mass === undefined ? score !== undefined && score < minConfidence : mass < minConfidence;
+  return { verdict: unsure || irreversible >= IRREVERSIBLE_ASK ? "ask" : verdict, ...base };
 }
 
 // One request per graded assignment; below the threshold the spawn keeps whatever omp resolved.
@@ -996,7 +1041,7 @@ async function registryKey(ctx: RuntimeContext, cfg: Config, forceRefresh: boole
 async function apiCandidates(ctx: RuntimeContext, cfg: Config, forceRefresh: boolean): Promise<string[]> {
   const seen: Record<string, true> = {};
   const out: string[] = [];
-  for (const raw of [await registryKey(ctx, cfg, forceRefresh), cfg.jev.provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined, process.env.JEV_API_KEY]) {
+  for (const raw of [lastGoodKey, await registryKey(ctx, cfg, forceRefresh), cfg.jev.provider === "openrouter" ? process.env.OPENROUTER_API_KEY : undefined, process.env.JEV_API_KEY]) {
     const value = raw?.trim();
     if (value && !seen[value]) {
       seen[value] = true;
@@ -1029,7 +1074,15 @@ function openAuthBreaker(accountDead: boolean): void {
 
 async function callJev(ctx: RuntimeContext, cfg: Config, state: unknown, questions: Record<string, unknown>, timeoutMs?: number): Promise<JevResponse> {
   // Elapsed backoff means the next real triage is the half-open probe: let it through.
-  if (Date.now() < authBlockedUntil) throw new Error("Jev auth circuit breaker active");
+  if (Date.now() < authBlockedUntil) {
+    // The breaker and the key cache are process-local, so rotating the credential used to mean
+    // waiting out the backoff (up to 5 minutes) in the session that was already open. Ask the
+    // registry once: a key this process has not burned yet means the credential changed, and this
+    // call becomes the probe instead of the wait.
+    const rotated = await registryKey(ctx, cfg, true);
+    if (!rotated || rejectedKeys.has(rotated)) throw new Error("Jev auth circuit breaker active");
+    resetAuthState();
+  }
   lastCallsUsed = 0;
   const tried: Record<string, true> = {};
   let lastStatus = 0;
@@ -1049,9 +1102,12 @@ async function callJev(ctx: RuntimeContext, cfg: Config, state: unknown, questio
         authBlockedUntil = 0;
         authFailures = 0;
         keyCache = { value: key, expiresAt: Date.now() + 300_000 };
+        lastGoodKey = key;
         return asRecord(JSON.parse(text)) as JevResponse;
       }
       const body = await response.text();
+      rejectedKeys.add(key);
+      if (key === lastGoodKey) lastGoodKey = undefined;
       lastStatus = response.status;
       lastBody = body;
       // Account gone for this candidate: skip it and try the next one. A forced refresh
@@ -1236,9 +1292,9 @@ async function decide(prompt: string, ctx: RuntimeContext, cfg: Config, tools: T
   const proposed = decisionOf(
     cfg,
     "jev",
-    pick(response, "task_type", TASK_TYPES, baseline.type),
-    pick(response, "complexity", COMPLEXITIES, baseline.complexity),
-    pick(response, "risk", RISKS, baseline.risk),
+    pickConfident(response, "task_type", TASK_TYPES, baseline.type, cfg.jev.minConfidence),
+    pickConfident(response, "complexity", COMPLEXITIES, baseline.complexity, cfg.jev.minConfidence),
+    pickConfident(response, "risk", RISKS, baseline.risk, cfg.jev.minConfidence),
     baseline.tool,
   );
   const score = confidence(response, "task_type");
@@ -1336,19 +1392,25 @@ export const __jevRouterTest = {
   cacheKey,
   resolveModel,
   pick,
+  pickConfident,
   dangerousCall,
+  lastGoodKeyForTest: () => lastGoodKey,
+  apiCandidates,
   callJev,
   authDelayMs,
   resetAuthState,
-  authState: () => ({ blockedUntil: authBlockedUntil, failures: authFailures }),
+  authState: () => ({ blockedUntil: authBlockedUntil, failures: authFailures, rejected: [...rejectedKeys] }),
   TASK_TYPES,
   COMPLEXITIES,
   RISKS,
   // Gate / cascade / verify decision points.
   confidence,
+  probabilityMass,
   redactAction,
   actionOf,
   gateVerdict,
+  DENY_MIN_MASS,
+  IRREVERSIBLE_ASK,
   cascadeTarget,
   verifyOutcome,
   thinkingSpecFor,
