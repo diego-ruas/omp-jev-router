@@ -4,23 +4,34 @@ import { join } from "node:path";
 import { __jevRouterTest as T } from "../extensions/jev-router.ts";
 
 const {
-  mergeRaw, validateConfig, chooseTarget, thinkingFor,
-  fastPath, heuristic, highRisk, normalize, cacheKey, resolveModel, pick,
-  dangerousCall, callJev, authDelayMs, resetAuthState, authState, TASK_TYPES, COMPLEXITIES, RISKS,
-  confidence, redactAction, actionOf, gateVerdict, cascadeTarget, verifyOutcome, thinkingSpecFor,
-  assistantText, recordPendingSpawns, takePendingSpawn, markCascadeHandoff, consumeCascadeHandoff,
-  resetDecisionMaps, DIFFICULTIES, prepareRoutes, candidatesFingerprint, validateRoute,
-  fallbackCode, exactInput, configStampForTest, cacheableGate, classifyModelChange, pickConfident,
-  lastGoodKeyForTest, apiCandidates, probabilityMass, DENY_MIN_MASS, candidateDescription, routeQuestion, pickCandidate,
+  mergeRaw, validateConfig, dangerousCall, callJev, authDelayMs, resetAuthState, authState,
+  probabilityMass, redactAction, actionOf, gateVerdict, GATE_VERDICTS,
+  verifyOutcome, VERIFY_VERDICTS, assistantText, fallbackCode, exactInput, cacheableGate,
+  lastGoodKeyForTest, apiCandidates,
 } = T;
 
-type TaskType = "coding" | "research" | "operations" | "documentation" | "review" | "planning" | "design" | "other";
-type Complexity = "trivial" | "low" | "medium" | "high";
-type Risk = "low" | "medium" | "high";
+// Formato de hoje: o modelo `typesafe/jev-router` roteia; o plugin só decide em dois pontos, o gate
+// de tool_call e a verificação do session_stop.
 type Shipped = {
-  routes: Array<{ when?: { type?: TaskType[]; complexity?: Complexity[]; risk?: Risk[] }; target: string }>;
-  targets: Record<string, { models: string[]; thinking: unknown }>;
+  enabled: boolean;
+  jev: { provider: string; endpoint: string; model: string; timeoutMs: number; cacheSeconds: number; maxPromptChars: number };
+  safety: {
+    enabled: boolean;
+    mode: string;
+    tools: string[];
+    jev: {
+      enabled: boolean; tools: string[]; timeoutMs: number; cacheSeconds: number;
+      maxActionChars: number; minConfidence: number; askInHeadless: string;
+    };
+  };
+  verify: { enabled: boolean; minConfidence: number; maxContinuations: number; maxAnswerChars: number };
+  logging: { enabled: boolean; path: string };
 };
+type MutableConfig = {
+  safety: { mode: string; jev: { enabled: boolean; minConfidence: number; askInHeadless: string } };
+  verify: { maxAnswerChars: number };
+  logging: { path: string };
+} & Record<string, unknown>;
 
 // Test fixture: exact shape asserted by the "valida sem issues" test below.
 const SHIPPED = JSON.parse(readFileSync(join(import.meta.dir, "..", "jev-router.json"), "utf8")) as unknown as Shipped;
@@ -32,12 +43,9 @@ function validCfg() {
   return { cfg, issues };
 }
 
-function tools(names: string[] = ["read", "write", "edit", "bash"]) {
-  return names.map((name) => ({ name }));
-}
-
-function decision(target: string, risk: Risk) {
-  return { source: "jev", type: "coding", complexity: "low", risk, target, agent: "implementer" } as Parameters<typeof thinkingFor>[1];
+// O validador rejeita o arquivo inteiro, então cada caso inválido precisa da própria cópia.
+function mutable(): MutableConfig {
+  return structuredClone(SHIPPED) as unknown as MutableConfig;
 }
 
 describe("shipped config", () => {
@@ -46,97 +54,63 @@ describe("shipped config", () => {
     expect(issues).toEqual([]);
     expect(cfg).toBeDefined();
   });
-  test("termina com catch-all", () => {
-    const last = SHIPPED.routes[SHIPPED.routes.length - 1];
-    expect(last.when).toBeUndefined();
-    expect(last.target).toBe("muse");
-  });
-});
-
-describe("policy: chooseTarget segue as rotas na ordem", () => {
-  const { cfg } = validCfg();
-  const cases: Array<[TaskType, Complexity, Risk, string]> = [
-    ["coding", "low", "high", "sol"],      // risco alto sempre sol
-    ["planning", "low", "high", "sol"],    // risco vence planejamento
-    ["planning", "low", "low", "opus"],
-    ["design", "low", "low", "sonnet"],
-    ["coding", "trivial", "low", "luna"],
-    ["coding", "high", "low", "opus"],
-    ["review", "low", "low", "sol"],
-    ["coding", "low", "medium", "sol"],
-    ["operations", "low", "medium", "sol"], // coding|operations + medium antes de operations+medium
-    ["research", "low", "low", "deepseek"],
-    ["operations", "medium", "low", "deepseek"],
-    ["documentation", "low", "low", "muse"], // catch-all
-    ["other", "low", "low", "muse"],
-  ];
-  for (const [type, cx, risk, want] of cases) {
-    test(`${type}/${cx}/${risk} -> ${want}`, () => {
-      expect(chooseTarget(cfg ?? {}, type, cx, risk)).toBe(want);
-    });
-  }
-});
-
-describe("thinkingFor", () => {
-  const { cfg } = validCfg();
-  test("sol: high->high, resto medium", () => {
-    expect(thinkingFor(cfg ?? {}, decision("sol", "high"))).toBe("high");
-    expect(thinkingFor(cfg ?? {}, decision("sol", "medium"))).toBe("medium");
-    expect(thinkingFor(cfg ?? {}, decision("sol", "low"))).toBe("medium");
-  });
-  test("opus medium, luna low", () => {
-    expect(thinkingFor(cfg ?? {}, decision("opus", "low"))).toBe("medium");
-    expect(thinkingFor(cfg ?? {}, decision("luna", "high"))).toBe("low");
+  test("não carrega mais roteamento", () => {
+    const raw = SHIPPED as unknown as Record<string, unknown>;
+    for (const key of ["routes", "targets", "cascade", "decision", "economy", "providers"]) {
+      expect(key in raw).toBe(false);
+    }
   });
 });
 
 describe("validateConfig rejeita arquivo inteiro", () => {
-  test("target inexistente na rota", () => {
-    const raw = structuredClone(SHIPPED);
-    raw.routes[0].target = "fantasma";
+  test("chave de roteamento deixada para trás", () => {
+    for (const key of ["routes", "targets", "decision", "economy", "cascade", "providers"]) {
+      const issues: string[] = [];
+      expect(validateConfig({ ...mutable(), [key]: {} }, issues)).toBeUndefined();
+      expect(issues.join("\n")).toMatch(/typesafe\/jev-router/);
+    }
+  });
+  test("layout antigo no topo (models/thinking/finalEval) também é flagado", () => {
+    for (const key of ["models", "thinking", "finalEval"]) {
+      const issues: string[] = [];
+      expect(validateConfig({ ...mutable(), [key]: {} }, issues)).toBeUndefined();
+      expect(issues.join("\n")).toMatch(/typesafe\/jev-router/);
+    }
+  });
+  test("safety.mode inválido", () => {
+    const raw = mutable();
+    raw.safety.mode = "automatico";
     const issues: string[] = [];
     expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/fantasma/);
+    expect(issues.join("\n")).toMatch(/safety\.mode/);
   });
-  test("sem catch-all final", () => {
-    const raw = structuredClone(SHIPPED);
-    raw.routes[raw.routes.length - 1] = { when: { type: ["coding"] }, target: "muse" };
+  test("safety.jev.askInHeadless inválido", () => {
+    const raw = mutable();
+    raw.safety.jev.askInHeadless = "bloquear";
     const issues: string[] = [];
     expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/catch-all/);
+    expect(issues.join("\n")).toMatch(/askInHeadless/);
   });
-  test("catch-all no meio", () => {
-    const raw = structuredClone(SHIPPED);
-    raw.routes.splice(1, 0, { target: "muse" });
+  test("minConfidence fora de 0..1 rejeita o arquivo", () => {
+    const raw = mutable();
+    raw.safety.jev.minConfidence = 7;
     const issues: string[] = [];
     expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/inalcanç/);
+    expect(issues.join("\n")).toMatch(/safety\.jev\.minConfidence/);
   });
-  test("thinking inválido", () => {
-    const raw = structuredClone(SHIPPED);
-    raw.targets.luna.thinking = "ultra";
+  test("verify.maxAnswerChars fora de faixa", () => {
+    const raw = mutable();
+    raw.verify.maxAnswerChars = 50;
     const issues: string[] = [];
     expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/thinking/);
+    expect(issues.join("\n")).toMatch(/verify\.maxAnswerChars/);
   });
-  test("provider fora de allow", () => {
-    const raw = structuredClone(SHIPPED);
-    raw.targets.luna.models = ["google/gemini-3-pro"];
+  test("logging.path vazio", () => {
+    const raw = mutable();
+    raw.logging.path = "";
     const issues: string[] = [];
     expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/providers\.allow/);
-  });
-  test("chaves do formato antigo são flagadas", () => {
-    const issues: string[] = [];
-    expect(validateConfig({ ...structuredClone(SHIPPED), models: {} }, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/formato antigo/);
-  });
-  test("enum inválido em when", () => {
-    const raw = structuredClone(SHIPPED);
-    raw.routes[0].when = { risk: ["extremo"] };
-    const issues: string[] = [];
-    expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/extremo/);
+    expect(issues.join("\n")).toMatch(/logging\.path/);
   });
   test("lista todos os problemas, não só o primeiro", () => {
     const issues: string[] = [];
@@ -148,103 +122,41 @@ describe("validateConfig rejeita arquivo inteiro", () => {
 describe("mergeRaw", () => {
   test("objetos fundem, arrays substituem, null deleta", () => {
     const out = mergeRaw(
-      { a: { x: 1, y: 2 }, routes: [1], keep: true },
-      { a: { y: 3 }, routes: [2], keep: null },
+      { a: { x: 1, y: 2 }, tools: [1], keep: true },
+      { a: { y: 3 }, tools: [2], keep: null },
     );
-    expect(out).toEqual({ a: { x: 1, y: 3 }, routes: [2] });
+    expect(out).toEqual({ a: { x: 1, y: 3 }, tools: [2] });
   });
-  test("override de um campo de um target preserva o resto", () => {
-    const out = mergeRaw(structuredClone(SHIPPED), {
-      targets: { sol: { thinking: "high" } },
+  test("override de um campo do gate preserva o resto da seção", () => {
+    const out = mergeRaw(structuredClone(SHIPPED) as unknown as Record<string, unknown>, {
+      safety: { mode: "enforce" },
     }) as unknown as Shipped;
-    expect(out.targets.sol.thinking).toBe("high");
-    expect(out.targets.sol.models).toEqual(SHIPPED.targets.sol.models);
-    expect(out.targets.luna).toEqual(SHIPPED.targets.luna);
+    expect(out.safety.mode).toBe("enforce");
+    expect(out.safety.enabled).toBe(SHIPPED.safety.enabled);
+    expect(out.safety.tools).toEqual(SHIPPED.safety.tools);
+    expect(out.safety.jev).toEqual(SHIPPED.safety.jev);
+    expect(out.verify).toEqual(SHIPPED.verify);
+    expect(out.jev).toEqual(SHIPPED.jev);
   });
 });
 
-describe("fastPath", () => {
-  const { cfg } = validCfg();
-  test("screenshot vai para operations/low/low", () => {
-    const d = fastPath(cfg ?? {}, "tire screenshots do site https://app.maleta.dev/", tools());
-    expect(d).toBeDefined();
-    expect([d?.type, d?.complexity, d?.risk]).toEqual(["operations", "low", "low"]);
-    expect(d?.source).toBe("fast-path");
+describe("pick: valor válido vence, inválido cai no fallback", () => {
+  const choice = (label: string) => ({ answers: { verdict: { type: "choice", choice: label, confidence: 0.99 } } });
+  const risky = { answers: { verdict: { type: "choice", choice: "deny", confidence: 0.99 }, irreversible: { type: "noul", noul: 0.9 } } };
+  test("o gate aceita só os rótulos de GATE_VERDICTS; qualquer outro cai no fallback ask", () => {
+    expect(GATE_VERDICTS).toEqual(["allow", "ask", "deny"]);
+    expect(gateVerdict(choice("allow"), 0.75).verdict).toBe("allow");
+    expect(gateVerdict(choice("ask"), 0.75).verdict).toBe("ask");
+    expect(gateVerdict(risky, 0.75).verdict).toBe("deny");
+    expect(gateVerdict(choice("astronauta"), 0.75).verdict).toBe("ask");
   });
-  test("continue curto é trivial", () => {
-    const d = fastPath(cfg ?? {}, "continue", tools());
-    expect([d?.type, d?.complexity]).toEqual(["other", "trivial"]);
-  });
-  test("prompt normal não entra em fast-path", () => {
-    expect(fastPath(cfg ?? {}, "fix the css bug in the header component with more detail here", tools())).toBeUndefined();
-  });
-});
-
-describe("heuristic", () => {
-  const { cfg } = validCfg();
-  test("css bug é coding", () => {
-    const d = heuristic(cfg ?? {}, "fix the css bug in the header component, the layout breaks on mobile viewports", tools());
-    expect(d.type).toBe("coding");
-    expect(d.source).toBe("fallback");
-  });
-  test("planejamento é planning (stem PT)", () => {
-    expect(heuristic(cfg ?? {}, "planejamento da arquitetura do novo módulo de pagamentos online agora", tools()).type).toBe("planning");
-  });
-  test("pesquisa é research (stem PT)", () => {
-    expect(heuristic(cfg ?? {}, "pesquise os preços mais recentes de GPUs para comparar modelos atuais", tools()).type).toBe("research");
-  });
-  test("produção é high risk -> sol", () => {
-    const d = heuristic(cfg ?? {}, "delete the production database records for the failing migration job now please", tools());
-    expect(d.risk).toBe("high");
-    expect(d.target).toBe("sol");
-  });
-  test("design token não é credencial", () => {
-    const p = "align the design tokens with the upstream theme file for the landing page layout";
-    expect(highRisk(normalize(p))).toBe(false);
-  });
-  test("token vazado com revoke é high", () => {
-    expect(highRisk(normalize("o token vazou, preciso revogar e gerar outro agora"))).toBe(true);
-  });
-  test("tela de password reset é UI copy: heuristic derruba para medium", () => {
-    const d = heuristic(cfg, "document the password reset screen layout for the settings page of the app", tools());
-    expect(d.type).toBe("documentation");
-    expect(d.risk).toBe("medium");
-  });
-});
-
-describe("resolveModel", () => {
-  const registry = [
-    { provider: "openai-codex", id: "gpt-6-luna" },
-    { provider: "commandcode", id: "meta/muse-spark-1.3-contributor" },
-  ];
-  const ctx = { models: { list: () => registry, current: () => registry[0] } };
-  test("match exato", () => {
-    expect(resolveModel(ctx, ["openai-codex/gpt-6-luna"])?.id).toBe("gpt-6-luna");
-  });
-  test("tolera prefixo de vendor no id do registro", () => {
-    expect(resolveModel(ctx, ["commandcode/muse-spark-1.3-contributor"])?.id).toBe("meta/muse-spark-1.3-contributor");
-  });
-  test("provider é exato: gpt via commandcode não casa openai-codex", () => {
-    expect(resolveModel(ctx, ["commandcode/gpt-6-luna"])).toBeUndefined();
-  });
-  test("fallback: primeira spec registrada vence", () => {
-    expect(resolveModel(ctx, ["anthropic/ausente", "openai-codex/gpt-6-luna"])?.provider).toBe("openai-codex");
-  });
-  test("nada registrado -> undefined", () => {
-    expect(resolveModel(ctx, ["google/gemini-3-pro"])).toBeUndefined();
-  });
-});
-
-describe("pick", () => {
-  test("valor válido vence, inválido cai no fallback", () => {
-    const ok = { answers: { task_type: { type: "choice", choice: "research" } } };
-    expect(pick(ok, "task_type", TASK_TYPES, "other")).toBe("research");
-    const bad = { answers: { task_type: { type: "choice", choice: "astronauta" } } };
-    expect(pick(bad, "task_type", TASK_TYPES, "other")).toBe("other");
-    expect(pick({}, "task_type", TASK_TYPES, "other")).toBe("other");
-  });
-  test("COMPLEXITIES/RISKS cobrem os literais", () => {
-    expect([...COMPLEXITIES, ...RISKS].join(",")).toMatch(/trivial.*high.*low.*medium.*high/);
+  test("a verificação aceita só os rótulos de VERIFY_VERDICTS; qualquer outro cai em done", () => {
+    expect(VERIFY_VERDICTS).toEqual(["done", "incomplete", "wrong_scope"]);
+    for (const label of VERIFY_VERDICTS) {
+      const response = { answers: { verdict: { type: "choice", choice: label, confidence: 0.99 } } };
+      expect(verifyOutcome(response, 0.8).verdict).toBe(label);
+    }
+    expect(verifyOutcome(choice("astronauta"), 0.8).verdict).toBe("done");
   });
 });
 
@@ -269,7 +181,7 @@ describe("dangerousCall", () => {
 
 describe("auth absoluto: cadeia de candidatas + half-open", () => {
   const { cfg } = validCfg();
-  const okBody = JSON.stringify({ answers: { task_type: { type: "choice", choice: "coding" }, complexity: { type: "choice", choice: "low" }, risk: { type: "choice", choice: "low" } } });
+  const okBody = JSON.stringify({ answers: { verdict: { type: "choice", choice: "allow", confidence: 0.9 }, irreversible: { type: "noul", noul: 0.1 } } });
   const ok = (key: string) => new Response(okBody, { status: 200 });
   const denied = () => new Response('{"error":{"message":"Unauthorized"}}', { status: 401 });
   const dead = () => new Response('{"error":{"message":"User not found.","code":401}}', { status: 401 });
@@ -292,121 +204,79 @@ describe("auth absoluto: cadeia de candidatas + half-open", () => {
   }
 
   test("registry obsoleta + env válida: usa env sem breaker", async () => {
-    T.resetAuthState();
+    resetAuthState();
     process.env.OPENROUTER_API_KEY = "env-good";
     const seen: string[] = [];
     await withFetch((key) => key === "env-good" ? ok(key) : denied(), async () => {
-      const res = await T.callJev(ctxWith("stale-key", seen), cfg, { request: "x" }, {});
-      expect(res.answers?.risk).toBeDefined();
+      const res = await callJev(ctxWith("stale-key", seen), cfg, { request: "x" }, {});
+      expect(res.answers?.verdict).toBeDefined();
     });
-    expect(T.authState().blockedUntil).toBeLessThanOrEqual(Date.now());
+    expect(authState().blockedUntil).toBeLessThanOrEqual(Date.now());
     delete process.env.OPENROUTER_API_KEY;
   });
 
   test("401 em todas: abre breaker; probe após backoff fecha em sucesso", async () => {
-    T.resetAuthState();
+    resetAuthState();
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.JEV_API_KEY;
     const seen: string[] = [];
     await withFetch(() => denied(), async () => {
-      await expect(T.callJev(ctxWith("dead-key", seen), cfg, { request: "x" }, {})).rejects.toThrow("401");
+      await expect(callJev(ctxWith("dead-key", seen), cfg, { request: "x" }, {})).rejects.toThrow("401");
       // Breaker aberto: nem chega ao fetch.
       let fetched = false;
       const orig = globalThis.fetch;
       // @ts-expect-error mock parcial
       globalThis.fetch = async () => { fetched = true; return denied(); };
-      await expect(T.callJev(ctxWith("dead-key", seen), cfg, { request: "x" }, {})).rejects.toThrow("circuit breaker");
+      await expect(callJev(ctxWith("dead-key", seen), cfg, { request: "x" }, {})).rejects.toThrow("circuit breaker");
       expect(fetched).toBe(false);
       globalThis.fetch = orig;
     });
-    expect(T.authDelayMs(1)).toBe(30_000);
-    expect(T.authDelayMs(4)).toBe(240_000);
-    expect(T.authDelayMs(9)).toBe(300_000);
-    T.resetAuthState();
+    expect(authDelayMs(1)).toBe(30_000);
+    expect(authDelayMs(4)).toBe(240_000);
+    expect(authDelayMs(9)).toBe(300_000);
+    resetAuthState();
     const seen2: string[] = [];
     await withFetch((key) => ok(key), async () => {
-      const res = await T.callJev(ctxWith("fresh-key", seen2), cfg, { request: "x" }, {});
-      expect(res.answers?.risk).toBeDefined();
+      const res = await callJev(ctxWith("fresh-key", seen2), cfg, { request: "x" }, {});
+      expect(res.answers?.verdict).toBeDefined();
     });
-    expect(T.authState().failures).toBe(0);
+    expect(authState().failures).toBe(0);
   });
 
   test("User not found no registry + env válida de outra conta: usa env", async () => {
-    T.resetAuthState();
+    resetAuthState();
     process.env.OPENROUTER_API_KEY = "env-other-account";
     delete process.env.JEV_API_KEY;
     let calls = 0;
     await withFetch((key) => { calls++; return key === "env-other-account" ? ok(key) : dead(); }, async () => {
-      const res = await T.callJev(ctxWith("gone", []), cfg, { request: "x" }, {});
-      expect(res.answers?.risk).toBeDefined();
+      const res = await callJev(ctxWith("gone", []), cfg, { request: "x" }, {});
+      expect(res.answers?.verdict).toBeDefined();
     });
     expect(calls).toBe(2);
-    expect(T.authState().blockedUntil).toBeLessThanOrEqual(Date.now());
+    expect(authState().blockedUntil).toBeLessThanOrEqual(Date.now());
     delete process.env.OPENROUTER_API_KEY;
   });
 
   test("User not found em todas: backoff longo imediato", async () => {
-    T.resetAuthState();
+    resetAuthState();
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.JEV_API_KEY;
     let calls = 0;
     await withFetch(() => { calls++; return dead(); }, async () => {
-      await expect(T.callJev(ctxWith("gone", []), cfg, { request: "x" }, {})).rejects.toThrow("User not found");
+      await expect(callJev(ctxWith("gone", []), cfg, { request: "x" }, {})).rejects.toThrow("User not found");
     });
     // 1 chamada: refresh devolve a mesma chave e o dedup pula o refetch.
     expect(calls).toBe(1);
-    expect(T.authState().blockedUntil - Date.now()).toBeGreaterThan(200_000);
-    T.resetAuthState();
+    expect(authState().blockedUntil - Date.now()).toBeGreaterThan(200_000);
+    resetAuthState();
   });
 });
 
-describe("cacheKey: normaliza case/pontuação, preserva palavras", () => {
-  test("mesmo prompt com case e pontuação diferentes acerta", () => {
-    expect(cacheKey("Fix the CSS bug!")).toBe(cacheKey("fix the css bug"));
-  });
-  test("whitespace extra não quebra o hit", () => {
-    expect(cacheKey("fix   the\ncss bug")).toBe(cacheKey("fix the css bug"));
-  });
-  test("palavras diferentes não colidem", () => {
-    expect(cacheKey("e agora o footer?")).not.toBe(cacheKey("e agora o header?"));
-  });
-  test("acentos não quebram o hit", () => {
-    expect(cacheKey("ação de correção")).toBe(cacheKey("acao de correcao"));
-  });
-});
-
-describe("seções novas da config shipped", () => {
+describe("config shipped: só gate e verificação decidem", () => {
   const { cfg } = validCfg();
-  test("os três pontos de decisão existem e vêm desligados", () => {
+  test("os dois pontos de decisão existem e vêm desligados", () => {
     expect(cfg.safety.jev.enabled).toBe(false);
     expect(cfg.verify.enabled).toBe(false);
-    expect(cfg.cascade.enabled).toBe(false);
-  });
-  test("cascade aponta para targets existentes", () => {
-    for (const difficulty of DIFFICULTIES) {
-      expect(cfg.targets[cfg.cascade.targets[difficulty]]).toBeDefined();
-    }
-  });
-  test("askInHeadless inválido rejeita o arquivo", () => {
-    const raw = structuredClone(SHIPPED) as Record<string, unknown>;
-    (raw.safety as { jev: { askInHeadless: string } }).jev.askInHeadless = "bloquear";
-    const issues: string[] = [];
-    expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/askInHeadless/);
-  });
-  test("minConfidence fora de 0..1 rejeita o arquivo", () => {
-    const raw = structuredClone(SHIPPED) as Record<string, unknown>;
-    (raw.safety as { jev: { minConfidence: number } }).jev.minConfidence = 7;
-    const issues: string[] = [];
-    expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/safety\.jev\.minConfidence/);
-  });
-  test("cascade para target inexistente rejeita o arquivo", () => {
-    const raw = structuredClone(SHIPPED) as Record<string, unknown>;
-    (raw.cascade as { targets: { easy: string } }).targets.easy = "fantasma";
-    const issues: string[] = [];
-    expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/cascade\.targets\.easy/);
   });
 });
 
@@ -454,12 +324,14 @@ describe("actionOf: só o necessário, nunca conteúdo de arquivo", () => {
 });
 
 describe("gateVerdict: massa de probabilidade + irreversibilidade", () => {
-  const choice = (c: string, conf?: number, probs?: Record<string, number>) => ({
-    type: "choice" as const, choice: c,
+  type Choice = { type: "choice"; choice: string; confidence?: number; probabilities?: Record<string, number> };
+  const choice = (c: string, conf?: number, probs?: Record<string, number>): Choice => ({
+    type: "choice",
+    choice: c,
     ...(conf === undefined ? {} : { confidence: conf }),
     ...(probs === undefined ? {} : { probabilities: probs }),
   });
-  const response = (verdict: ReturnType<typeof choice>, irreversible: number) => ({
+  const response = (verdict: Choice, irreversible: number) => ({
     answers: { verdict, irreversible: { type: "noul" as const, noul: irreversible } },
   });
 
@@ -501,24 +373,6 @@ describe("gateVerdict: massa de probabilidade + irreversibilidade", () => {
   });
 });
 
-describe("cascadeTarget: dificuldade -> target", () => {
-  const { cfg } = validCfg();
-  const response = (choice: string, conf?: number) => ({ answers: { difficulty: { type: "choice", choice, ...(conf === undefined ? {} : { confidence: conf }) } } });
-  test("mapeia easy/medium/hard pelos targets da config", () => {
-    expect(cascadeTarget(response("easy", 0.9), cfg, 0.7)).toBe(cfg.cascade.targets.easy);
-    expect(cascadeTarget(response("hard", 0.9), cfg, 0.7)).toBe(cfg.cascade.targets.hard);
-  });
-  test("abaixo do limiar mantém o que o omp resolveu", () => {
-    expect(cascadeTarget(response("hard", 0.3), cfg, 0.7)).toBeUndefined();
-  });
-  test("thinkingSpecFor usa o nível do target", () => {
-    expect(thinkingSpecFor(cfg, cfg.cascade.targets.easy)).toBe("low");
-    expect(thinkingSpecFor(cfg, cfg.cascade.targets.hard)).toBe("medium");
-    // sol's thinking is a per-risk object: the cascade takes the default, never a risk it does not have.
-    expect(thinkingSpecFor(cfg, "sol")).toBe("medium");
-  });
-});
-
 describe("verifyOutcome: os dois primitivos precisam concordar", () => {
   const response = (choice: string, complete: number, conf = 0.9) => ({
     answers: { verdict: { type: "choice", choice, confidence: conf }, complete: { type: "noul", noul: complete } },
@@ -551,104 +405,6 @@ describe("assistantText: só texto final, nada de thinking ou tool call", () => 
   });
 });
 
-describe("cascade: correlaciona task call com spawn", () => {
-  test("batch casa pelo nome do item", () => {
-    resetDecisionMaps();
-    recordPendingSpawns("s1", { tasks: [{ name: "Alpha", task: "listar arquivos" }, { name: "Beta", task: "contar linhas" }] });
-    expect(takePendingSpawn("s1", "Beta")).toBe("contar linhas");
-    expect(takePendingSpawn("s1", "Alpha")).toBe("listar arquivos");
-    expect(takePendingSpawn("s1", "Alpha")).toBeUndefined();
-  });
-  test("sem nome, consome na ordem de spawn", () => {
-    resetDecisionMaps();
-    recordPendingSpawns("s1", { tasks: [{ task: "primeiro" }, { task: "segundo" }] });
-    expect(takePendingSpawn("s1", "Task")).toBe("primeiro");
-    expect(takePendingSpawn("s1", "Task-2")).toBe("segundo");
-  });
-  test("shape flat (task.batch off) também é registrado", () => {
-    resetDecisionMaps();
-    recordPendingSpawns("s1", { name: "Solo", task: "unica tarefa" });
-    expect(takePendingSpawn("s1", "Solo")).toBe("unica tarefa");
-  });
-  test("sessão sem pendência não inventa atribuição", () => {
-    resetDecisionMaps();
-    expect(takePendingSpawn("s2", "Alpha")).toBeUndefined();
-  });
-  test("handoff é consumido uma vez e reconhecido dentro do prompt do filho", () => {
-    resetDecisionMaps();
-    markCascadeHandoff("# Target\n/home/diego/x.ts\n\n# Change\ncontar linhas");
-    const childPrompt = "Complete assignment thoroughly:\n\n# Target\n/home/diego/x.ts\n\n# Change\ncontar linhas";
-    expect(consumeCascadeHandoff(childPrompt)).toBe(true);
-    expect(consumeCascadeHandoff(childPrompt)).toBe(false);
-  });
-  test("prompt de outra sessão não consome o handoff", () => {
-    resetDecisionMaps();
-    markCascadeHandoff("refatorar o módulo de pagamentos");
-    expect(consumeCascadeHandoff("corrigir o css do header")).toBe(false);
-    expect(consumeCascadeHandoff("refatorar o módulo de pagamentos")).toBe(true);
-  });
-});
-
-describe("prepareRoutes: só candidato que o host consegue despachar", () => {
-  const { cfg } = validCfg();
-  const registry = [
-    { provider: "openai-codex", id: "gpt-6-luna" },
-    { provider: "commandcode", id: "meta/muse-spark-1.3-contributor" },
-    { provider: "anthropic", id: "claude-opus-5-5" },
-  ];
-  const ctx = { models: { list: () => registry } };
-
-  test("inclui apenas targets alcançáveis por rota e registrados", () => {
-    expect(prepareRoutes(ctx, cfg).map((c) => c.id)).toEqual(["luna", "muse", "opus"]);
-  });
-  test("target sem modelo no registro não vira candidato", () => {
-    const ids = prepareRoutes(ctx, cfg).map((c) => c.id);
-    expect(ids).not.toContain("sol");
-    expect(ids).not.toContain("sonnet");
-    expect(ids).not.toContain("deepseek");
-  });
-  test("target fora de qualquer rota não vira candidato", () => {
-    const raw = structuredClone(SHIPPED) as unknown as Record<string, unknown>;
-    (raw.targets as Record<string, unknown>).orfao = { models: ["openai-codex/gpt-6-luna"], thinking: "low" };
-    const issues: string[] = [];
-    const custom = validateConfig(raw, issues);
-    expect(custom).toBeDefined();
-    expect(prepareRoutes(ctx, custom ?? cfg).map((c) => c.id)).not.toContain("orfao");
-  });
-  test("fingerprint muda quando o conjunto observado muda", () => {
-    const before = candidatesFingerprint(prepareRoutes(ctx, cfg));
-    const wider = { models: { list: () => [...registry, { provider: "openai-codex", id: "gpt-6-sol" }] } };
-    expect(candidatesFingerprint(prepareRoutes(wider, cfg))).not.toBe(before);
-  });
-});
-
-describe("validateRoute: a seleção é reconferida antes de aplicar", () => {
-  const { cfg } = validCfg();
-  const candidates = [{ id: "muse", spec: "commandcode/meta/muse-spark-1.3-contributor" }, { id: "opus", spec: "anthropic/claude-opus-5-5" }];
-  const ok = { stamp: "", fingerprint: candidatesFingerprint(candidates), expiresAt: Date.now() + 5_000 };
-  const stamped = () => ({ ...ok, stamp: configStampForTest() });
-
-  test("aceita um ID preparado e vigente", () => {
-    expect(validateRoute(candidates, stamped(), "muse", cfg).accepted).toBe(true);
-  });
-  test("ID que o host não preparou é invalid_id", () => {
-    expect(validateRoute(candidates, stamped(), "sonnet", cfg).rejection).toBe("invalid_id");
-  });
-  test("revisão da policy mudou: stale_revision", () => {
-    expect(validateRoute(candidates, { ...ok, stamp: "outra-revisao" }, "muse", cfg).rejection).toBe("stale_revision");
-  });
-  test("read-set mudou: stale_read_set", () => {
-    expect(validateRoute(candidates, { ...stamped(), fingerprint: "outro" }, "muse", cfg).rejection).toBe("stale_read_set");
-  });
-  test("decisão preparada expirou: expired", () => {
-    expect(validateRoute(candidates, { ...stamped(), expiresAt: Date.now() - 1 }, "muse", cfg).rejection).toBe("expired");
-  });
-  test("target sem payload despachável: unauthorized", () => {
-    const semModelo = { ...cfg, targets: { ...cfg.targets, muse: { models: [], thinking: "low" } } };
-    expect(validateRoute(candidates, stamped(), "muse", semModelo).rejection).toBe("unauthorized");
-  });
-});
-
 describe("fallbackCode: motivo tipado em vez de texto livre", () => {
   test("mapeia as causas conhecidas", () => {
     expect(fallbackCode("Jev auth circuit breaker active")).toBe("circuit_open");
@@ -678,89 +434,58 @@ describe("cacheableGate: allow pode ser cacheado, recusa nunca", () => {
   });
 });
 
-describe("classifyModelChange: revert do host não é escolha do usuário", () => {
-  const state = { appliedModel: "commandcode/x/muse", previousModel: "commandcode/deepseek/flash" };
-  test("mesmo modelo que o router deixou: same", () => {
-    expect(classifyModelChange(state, "commandcode/x/muse")).toBe("same");
-  });
-  test("voltou ao modelo de antes do switch: revert", () => {
-    expect(classifyModelChange(state, "commandcode/deepseek/flash")).toBe("revert");
-  });
-  test("terceiro modelo, escolhido fora do router: manual", () => {
-    expect(classifyModelChange(state, "anthropic/claude-opus-5-5")).toBe("manual");
-  });
-  test("sem switch anterior não há o que comparar", () => {
-    expect(classifyModelChange({}, "anthropic/claude-opus-5-5")).toBe("same");
-  });
-});
-
-describe("seleção direta por ID (decision.mode: select)", () => {
-  const { cfg } = validCfg();
-  const registry = [
-    { provider: "openai-codex", id: "gpt-6-luna" },
-    { provider: "commandcode", id: "meta/muse-spark-1.3-contributor" },
-    { provider: "anthropic", id: "claude-opus-5-5" },
-  ];
-  const ctx = { models: { list: () => registry } };
-  const candidates = prepareRoutes(ctx, cfg);
-  const answer = (choice: string, conf?: number) => ({
-    answers: { route: { type: "choice", choice, ...(conf === undefined ? {} : { confidence: conf }) } },
+describe("modelo servido pelo roteador", () => {
+  test("espera o índice de geração e associa somente ao response id exato", async () => {
+    const fetchBefore = globalThis.fetch;
+    const setTimeoutBefore = globalThis.setTimeout;
+    let calls = 0;
+    globalThis.fetch = async (_url, options) => {
+      expect(String(_url)).toContain("/generation?id=gen-exato");
+      expect((options?.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
+      return ++calls === 1
+        ? new Response("", { status: 404 })
+        : new Response(JSON.stringify({ data: { id: "gen-exato", model: "openai/gpt-6-sol" } }));
+    };
+    globalThis.setTimeout = ((callback: () => void) => { callback(); return 0; }) as typeof setTimeout;
+    try {
+      const ctx = { modelRegistry: { getApiKeyForProvider: async () => "test-key" } };
+      expect(await T.servedModel(ctx, "gen-exato")).toBe("openai/gpt-6-sol");
+      expect(calls).toBe(2);
+      globalThis.fetch = async () => new Response(JSON.stringify({ data: { id: "gen-antigo", model: "wrong" } }));
+      expect(await T.servedModel(ctx, "gen-exato")).toBeUndefined();
+    } finally {
+      globalThis.fetch = fetchBefore;
+      globalThis.setTimeout = setTimeoutBefore;
+    }
   });
 
-  test("o modo shipped segue classify (paridade com a tabela de rotas)", () => {
-    expect(cfg.decision.mode).toBe("classify");
-  });
-  test("as descrições vêm do config, não do código", () => {
-    const luna = candidates.find((c) => c.id === "luna");
-    expect(luna).toBeDefined();
-    expect(candidateDescription(cfg, luna!)).toBe(cfg.targets.luna.description);
-    const semDescricao = { ...cfg, targets: { ...cfg.targets, luna: { models: cfg.targets.luna.models, thinking: "low" } } };
-    expect(candidateDescription(semDescricao, luna!)).toBe("luna: openai-codex/gpt-6-luna");
-  });
-  test("descrição nunca passa de 160 caracteres", () => {
-    const longo = { ...cfg, targets: { ...cfg.targets, luna: { ...cfg.targets.luna, description: "x".repeat(400) } } };
-    expect(candidateDescription(longo, candidates[0]).length).toBe(160);
-  });
-  test("a pergunta carrega exatamente os candidatos preparados", () => {
-    const question = routeQuestion(cfg, candidates) as { route: { criteria: Record<string, string> } };
-    expect(Object.keys(question.route.criteria)).toEqual(candidates.map((c) => c.id));
-    expect(question.route.criteria.muse).toBe(cfg.targets.muse.description);
-  });
-  test("ID preparado e confiante é aceito", () => {
-    expect(pickCandidate(answer("muse", 0.9), candidates, 0.6)).toEqual({ id: "muse" });
-  });
-  test("ID que o host não preparou é invalid_id", () => {
-    expect(pickCandidate(answer("sonnet", 0.9), candidates, 0.6).reason).toBe("invalid_id");
-  });
-  test("resposta ausente ou não-choice é invalid_id", () => {
-    expect(pickCandidate({}, candidates, 0.6).reason).toBe("invalid_id");
-    expect(pickCandidate({ answers: { route: { type: "noul", noul: 0.9 } } }, candidates, 0.6).reason).toBe("invalid_id");
-  });
-  test("abaixo do limiar é abstenção, não seleção", () => {
-    expect(pickCandidate(answer("muse", 0.4), candidates, 0.6).reason).toBe("low_confidence");
-  });
-  test("sem confidence reportada o ID vale", () => {
-    expect(pickCandidate(answer("opus"), candidates, 0.6)).toEqual({ id: "opus" });
-  });
-  test("modo inválido rejeita o arquivo inteiro", () => {
-    const raw = structuredClone(SHIPPED) as unknown as Record<string, unknown>;
-    (raw.decision as { mode: string }).mode = "automatico";
-    const issues: string[] = [];
-    expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/decision\.mode/);
-  });
-  test("description vazia ou longa demais rejeita o arquivo", () => {
-    const raw = structuredClone(SHIPPED) as unknown as Record<string, unknown>;
-    (raw.targets as Record<string, { description?: string }>).muse.description = "  ";
-    const issues: string[] = [];
-    expect(validateConfig(raw, issues)).toBeUndefined();
-    expect(issues.join("\n")).toMatch(/targets\.muse\.description/);
+  test("o hook publica a geração observada e ignora a sessão do modelo direto", async () => {
+    const fetchBefore = globalThis.fetch;
+    const handlers: Record<string, (event: unknown, ctx: unknown) => void> = {};
+    const statuses: string[] = [];
+    const { promise: displayed, resolve } = Promise.withResolvers<void>();
+    const ctx = {
+      sessionManager: { getSessionId: () => "test-session" },
+      modelRegistry: { getApiKeyForProvider: async () => "test-key" },
+      ui: { setStatus: (_key: string, value: string) => { statuses.push(value); resolve(); } },
+    };
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: { id: "gen-atual", model: "openai/gpt-6-luna" } }));
+    try {
+      T.observeServedModel({ on: (name: string, handler: (event: unknown, ctx: unknown) => void) => { handlers[name] = handler; } } as never);
+      handlers.message_end({ message: { role: "assistant", model: "typesafe/jev-router", responseId: "gen-atual" } }, ctx);
+      await displayed;
+      expect(statuses).toEqual(["openai/gpt-6-luna"]);
+      handlers.message_end({ message: { role: "assistant", model: "gpt-6-sol", responseId: "gen-atual" } }, ctx);
+      expect(statuses).toEqual(["openai/gpt-6-luna"]);
+    } finally {
+      globalThis.fetch = fetchBefore;
+    }
   });
 });
 
 describe("credencial rotacionada não espera o backoff", () => {
   const { cfg } = validCfg();
-  const okBody = JSON.stringify({ answers: { task_type: { type: "choice", choice: "coding" } } });
+  const okBody = JSON.stringify({ answers: { verdict: { type: "choice", choice: "allow", confidence: 0.9 } } });
   const denied = () => new Response('{"error":{"message":"User not found"}}', { status: 401 });
   const ok = (key: string) => new Response(key === "good-key" ? okBody : '{"error":{"message":"User not found"}}', { status: key === "good-key" ? 200 : 401 });
 
@@ -779,67 +504,39 @@ describe("credencial rotacionada não espera o backoff", () => {
   }
 
   test("chave morta abre o breaker; a mesma chave não passa mais", async () => {
-    T.resetAuthState();
+    resetAuthState();
     delete process.env.OPENROUTER_API_KEY; delete process.env.JEV_API_KEY;
     await withFetch(denied, async () => {
-      await expect(T.callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("401");
-      await expect(T.callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("circuit breaker");
+      await expect(callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("401");
+      await expect(callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("circuit breaker");
     });
-    T.resetAuthState();
+    resetAuthState();
   });
 
   test("chave nova durante o breaker é sondada e destrava a decisão", async () => {
-    T.resetAuthState();
+    resetAuthState();
     delete process.env.OPENROUTER_API_KEY; delete process.env.JEV_API_KEY;
     await withFetch(denied, async () => {
-      await expect(T.callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("401");
+      await expect(callJev(ctxWith(["bad-key"]), cfg, { request: "x" }, {})).rejects.toThrow("401");
     });
-    expect(T.authState().blockedUntil).toBeGreaterThan(Date.now());
-    expect(T.authState().rejected).toContain("bad-key");
+    expect(authState().blockedUntil).toBeGreaterThan(Date.now());
+    expect(authState().rejected).toContain("bad-key");
     // Usuário troca a credencial: o registry passa a devolver uma chave que este processo não queimou.
     await withFetch((key) => ok(key), async () => {
-      const res = await T.callJev(ctxWith(["good-key"]), cfg, { request: "x" }, {});
-      expect(res.answers?.task_type).toBeDefined();
+      const res = await callJev(ctxWith(["good-key"]), cfg, { request: "x" }, {});
+      expect(res.answers?.verdict).toBeDefined();
     });
-    expect(T.authState().blockedUntil).toBeLessThanOrEqual(Date.now());
-    T.resetAuthState();
-  });
-});
-
-describe("pickConfident: confiança por campo, não uma só para todos", () => {
-  const answer = (fields: Record<string, { choice: string; confidence?: number }>) => ({
-    answers: Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, { type: "choice", ...v }])),
-  });
-  test("label confiante vence o heurístico", () => {
-    expect(pickConfident(answer({ complexity: { choice: "high", confidence: 0.92 } }), "complexity", COMPLEXITIES, "low", 0.6)).toBe("high");
-  });
-  test("label abaixo do limiar cai no valor determinístico daquele campo", () => {
-    expect(pickConfident(answer({ complexity: { choice: "low", confidence: 0.37 } }), "complexity", COMPLEXITIES, "high", 0.6)).toBe("high");
-  });
-  test("task_type confiante não carrega complexity insegura junto", () => {
-    const response = answer({
-      task_type: { choice: "research", confidence: 1 },
-      complexity: { choice: "low", confidence: 0.37 },
-      risk: { choice: "low", confidence: 0.99 },
-    });
-    expect(pickConfident(response, "task_type", TASK_TYPES, "other", 0.6)).toBe("research");
-    expect(pickConfident(response, "complexity", COMPLEXITIES, "medium", 0.6)).toBe("medium");
-    expect(pickConfident(response, "risk", RISKS, "medium", 0.6)).toBe("low");
-  });
-  test("sem confidence reportada o valor do Jev vale", () => {
-    expect(pickConfident(answer({ risk: { choice: "high" } }), "risk", RISKS, "low", 0.6)).toBe("high");
-  });
-  test("valor inválido cai no determinístico mesmo com confidence alta", () => {
-    expect(pickConfident(answer({ risk: { choice: "extremo", confidence: 0.99 } }), "risk", RISKS, "low", 0.6)).toBe("low");
+    expect(authState().blockedUntil).toBeLessThanOrEqual(Date.now());
+    resetAuthState();
   });
 });
 
 describe("candidata vencedora é tentada primeiro", () => {
   const { cfg } = validCfg();
-  const okBody = JSON.stringify({ answers: { task_type: { type: "choice", choice: "coding" } } });
+  const okBody = JSON.stringify({ answers: { verdict: { type: "choice", choice: "allow", confidence: 0.9 } } });
 
   test("depois de um sucesso com a chave de env, a próxima decisão não paga a chave morta do registry", async () => {
-    T.resetAuthState();
+    resetAuthState();
     process.env.OPENROUTER_API_KEY = "env-good";
     const seen: string[] = [];
     const ctx = {
@@ -856,25 +553,25 @@ describe("candidata vencedora é tentada primeiro", () => {
         : new Response('{"error":{"message":"User not found"}}', { status: 401 });
     };
     try {
-      await T.callJev(ctx, cfg, { request: "x" }, {});
+      await callJev(ctx, cfg, { request: "x" }, {});
       expect(seen).toEqual(["registry-dead", "env-good"]);   // primeira: paga a morta, acha a viva
-      expect(T.lastGoodKeyForTest()).toBe("env-good");
+      expect(lastGoodKeyForTest()).toBe("env-good");
       seen.length = 0;
-      await T.callJev(ctx, cfg, { request: "y" }, {});
+      await callJev(ctx, cfg, { request: "y" }, {});
       expect(seen).toEqual(["env-good"]);                   // segunda: direto na viva
     } finally {
       globalThis.fetch = orig;
       delete process.env.OPENROUTER_API_KEY;
-      T.resetAuthState();
+      resetAuthState();
     }
   });
 
   test("a chave vencedora aparece uma vez só na lista de candidatas", async () => {
-    T.resetAuthState();
+    resetAuthState();
     process.env.OPENROUTER_API_KEY = "same-key";
     const ctx = { modelRegistry: { getApiKeyForProvider: async () => "same-key" } };
     expect(await apiCandidates(ctx, cfg, false)).toEqual(["same-key"]);
     delete process.env.OPENROUTER_API_KEY;
-    T.resetAuthState();
+    resetAuthState();
   });
 });
