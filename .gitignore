@@ -1,1 +1,16 @@
+# Dependencies
 node_modules/
+
+# Python bytecode (bench/e2e/bench.py, jev-benchmark.py)
+__pycache__/
+
+# The graphify plugin writes its cache into any session cwd, this repo included
+graphify-out/
+
+# `bun pm pack` output, produced by the release workflow
+*.tgz
+
+# A real .env must never be committed. The benchmark fixture is the deliberate exception:
+# it holds fake values that the X01/X05 prompts read and rewrite.
+.env
+!bench/e2e/fixtures/.env

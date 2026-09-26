@@ -1,7 +1,7 @@
 {
   "name": "omp-jev-router",
-  "version": "0.3.0",
-  "description": "Jev Decision Layer: cached Jev triage routing (models + thinking), tool gate, subagent cascade and post-run verification, all host-validated",
+  "version": "0.4.0",
+  "description": "Jev for omp: the official typesafe/jev-router model does the routing; this plugin adds the host-side tool gate and post-run verification",
   "type": "module",
   "scripts": {
     "test": "bun test",
